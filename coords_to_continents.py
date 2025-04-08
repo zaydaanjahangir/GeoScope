@@ -25,22 +25,27 @@ def latlong_to_continent(lat, lon):
         print(f"Error for ({lat}, {lon}): {e}")
         return None
 
-# Read the coordinates CSV. 
-# Assume the CSV has columns 'latitude' and 'longitude'
+# Read the coordinates CSV. Assume the CSV has columns 'latitude' and 'longitude'
 df = pd.read_csv("Streetview_Image_Dataset/coordinates.csv")
 
-# Create a new column for continent labels.
+# Create a list to store continent labels.
 continents = []
 
+# Process each row with progress tracking.
 for index, row in tqdm(df.iterrows(), total=len(df)):
     lat, lon = row['latitude'], row['longitude']
     continent = latlong_to_continent(lat, lon)
     continents.append(continent)
-    time.sleep(1)  # Enforce a 1-second delay between requests (Nominatim policy)
+    time.sleep(1)  # Enforce a 1-second delay between requests
 
+    # Every 1000 iterations, save intermediate results.
+    if (index + 1) % 1000 == 0:
+        df['continent'] = continents
+        intermediate_filename = f"coordinates_with_continents_{index+1}.csv"
+        df.to_csv(intermediate_filename, index=False)
+        print(f"Intermediate save: {intermediate_filename}")
+
+# Assign final continent labels and save complete CSV.
 df['continent'] = continents
-
-# Save the new CSV with continent labels.
 df.to_csv("coordinates_with_continents.csv", index=False)
-
 print("Finished processing. Output saved as 'coordinates_with_continents.csv'.")
