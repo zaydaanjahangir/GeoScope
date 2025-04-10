@@ -1,3 +1,4 @@
 venv/
 Streetview_Image_Dataset/
 .env
+data/
