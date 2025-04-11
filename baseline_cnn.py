@@ -20,6 +20,10 @@ in the CSV file "coordinates_with_continents_mapbox.csv". The classification for
 named 'continent'. The images are not pre-split, so we will perform a random train-test split.
 '''
 
+# Create device object: use CUDA if available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
 # Custom dataset for the Streetview images using the CSV file for labels
 class StreetviewDataset(Dataset):
     def __init__(self, csv_file, img_dir, transform=None):
@@ -33,7 +37,6 @@ class StreetviewDataset(Dataset):
         continents = sorted(self.data['continent'].unique())
         self.label_map = {label: idx for idx, label in enumerate(continents)}
 
-    
     def __len__(self):
         return len(self.data)
     
@@ -43,7 +46,7 @@ class StreetviewDataset(Dataset):
         image = Image.open(img_path).convert("RGB")
         if self.transform:
             image = self.transform(image)
-        # Get the label from the 'continent' column; pandas handles header automatically
+        # Get the label from the 'continent' column
         label_str = self.data.iloc[idx]['continent']
         label = self.label_map[label_str]
         return image, label
@@ -84,6 +87,7 @@ Assume the CNN has been updated to accept RGB images (in_channels=3).
 '''
 
 conv_net = Conv_Net()
+conv_net.to(device)  # Move the model to the appropriate device
 
 '''
 PART 4:
@@ -99,7 +103,7 @@ Train your model.
 '''
 
 cnn_train_losses = []
-num_epochs_cnn = 3
+num_epochs_cnn = 15
 
 for epoch in range(num_epochs_cnn):
     running_loss_cnn = 0.0
@@ -108,6 +112,9 @@ for epoch in range(num_epochs_cnn):
     # Wrap the DataLoader iterator with tqdm to show batch progress
     for i, data in enumerate(tqdm(trainloader, desc=f"Epoch {epoch+1}/{num_epochs_cnn}"), 0):
         inputs, labels = data
+        # Move inputs and labels to the device
+        inputs, labels = inputs.to(device), labels.to(device)
+        
         optimizer_cnn.zero_grad()
         outputs = conv_net(inputs)
         loss = criterion(outputs, labels)
@@ -118,7 +125,6 @@ for epoch in range(num_epochs_cnn):
     epoch_loss = running_loss_cnn / len(trainloader)
     cnn_train_losses.append(epoch_loss)
     print(f'Epoch {epoch+1}/{num_epochs_cnn}, CNN Training loss: {epoch_loss:.4f}')
-
 
 print('Finished Training CNN')
 
@@ -134,9 +140,10 @@ total_cnn = 0
 
 conv_net.eval()
 
-with torch.no_grad():  # Since we're not training, we don't need to calculate gradients
-    for data in testloader:
+with torch.no_grad():
+    for data in tqdm(testloader, desc="Evaluating"):
         images, labels = data
+        images, labels = images.to(device), labels.to(device)
         outputs_cnn = conv_net(images)
         _, predicted_cnn = torch.max(outputs_cnn, 1)
         total_cnn += labels.size(0)
