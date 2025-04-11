@@ -5,13 +5,15 @@ import tensorflow as tf
 from tensorflow.keras import layers, models, optimizers, callbacks
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
+from sklearn.utils.class_weight import compute_class_weight
 import matplotlib.pyplot as plt
 import kagglehub
 
+# Constants
 IMAGE_SIZE = (224, 224)
 BATCH_SIZE = 32
 EPOCHS = 30
-LEARNING_RATE = 0.001
+INITIAL_LR = 0.0001
 
 
 def download_kaggle_dataset():
@@ -46,7 +48,6 @@ def find_images_in_download(path, df):
         df = df.iloc[:len(image_paths)].copy()
 
     df['image_path'] = image_paths[:len(df)]
-
     print(f"Matched {len(df)} images to CSV rows")
     return df
 
@@ -70,11 +71,14 @@ def load_data(csv_path):
         print(f"\nUnique classes: {unique_classes}")
         print(f"Number of classes: {num_classes}")
 
-        max_label = df['continent_encoded'].max()
-        if max_label >= num_classes:
-            raise ValueError(f"Invalid label encoding: max label {max_label} >= num_classes {num_classes}")
+        # Compute class weights
+        class_weights = compute_class_weight('balanced',
+                                             classes=np.unique(df['continent_encoded']),
+                                             y=df['continent_encoded'])
+        class_weights = dict(enumerate(class_weights))
+        print("\nClass weights:", class_weights)
 
-        return df, label_encoder, num_classes
+        return df, label_encoder, num_classes, class_weights
 
     except Exception as e:
         print(f"\nError in load_data(): {str(e)}")
@@ -91,8 +95,12 @@ def create_data_pipeline(df, image_size, batch_size, is_training=False):
 
     def augment(image, label):
         image = tf.image.random_flip_left_right(image)
-        image = tf.image.random_brightness(image, max_delta=0.2)
-        image = tf.image.random_contrast(image, lower=0.8, upper=1.2)
+        image = tf.image.random_brightness(image, max_delta=0.3)
+        image = tf.image.random_contrast(image, lower=0.7, upper=1.3)
+        image = tf.image.random_hue(image, max_delta=0.2)
+        image = tf.image.random_saturation(image, lower=0.7, upper=1.3)
+        image = tf.image.central_crop(image, np.random.uniform(0.8, 1.0))
+        image = tf.image.resize(image, image_size)
         return image, label
 
     filenames = df['image_path'].values
@@ -117,16 +125,19 @@ def create_model(input_shape, num_classes):
         weights='imagenet',
         input_shape=input_shape
     )
+
     base_model.trainable = False
 
     inputs = layers.Input(shape=input_shape)
     x = base_model(inputs, training=False)
     x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dense(256, activation='relu')(x)
+    x = layers.Dense(512, activation='relu')(x)
     x = layers.Dropout(0.5)(x)
+    x = layers.Dense(256, activation='relu')(x)
+    x = layers.Dropout(0.3)(x)
     outputs = layers.Dense(num_classes, activation='softmax')(x)
 
-    return models.Model(inputs, outputs)
+    return models.Model(inputs, outputs), base_model
 
 
 def plot_training_history(history):
@@ -147,6 +158,7 @@ def plot_training_history(history):
 
 
 def main():
+    # Setup paths
     script_dir = os.path.dirname(os.path.abspath(__file__))
     csv_path = os.path.join(script_dir, 'data', 'coordinates_with_continents_mapbox.csv')
 
@@ -156,7 +168,7 @@ def main():
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"CSV file not found at: {csv_path}")
 
-    df, label_encoder, num_classes = load_data(csv_path)
+    df, label_encoder, num_classes, class_weights = load_data(csv_path)
     print(f"\nSetting NUM_CLASSES to: {num_classes}")
 
     train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
@@ -164,51 +176,91 @@ def main():
     train_dataset = create_data_pipeline(train_df, IMAGE_SIZE, BATCH_SIZE, is_training=True)
     val_dataset = create_data_pipeline(val_df, IMAGE_SIZE, BATCH_SIZE, is_training=False)
 
-    model = create_model(IMAGE_SIZE + (3,), num_classes)
+    model, base_model = create_model(IMAGE_SIZE + (3,), num_classes)
+
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        INITIAL_LR, decay_steps=1000, decay_rate=0.96, staircase=True)
+
     model.compile(
-        optimizer=optimizers.Adam(LEARNING_RATE),
+        optimizer=optimizers.Adam(lr_schedule),
         loss='sparse_categorical_crossentropy',
         metrics=['accuracy']
     )
 
-    # Create checkpoint directory if it doesn't exist
     os.makedirs('checkpoints', exist_ok=True)
-
     callbacks_list = [
-        callbacks.EarlyStopping(patience=5, restore_best_weights=True),
+        callbacks.EarlyStopping(patience=10, restore_best_weights=True, monitor='val_loss'),
         callbacks.ModelCheckpoint(
-            'checkpoints/best_model.h5',
+            'checkpoints/best_model.keras',
             save_best_only=True,
             monitor='val_accuracy',
             mode='max'
         ),
         callbacks.ModelCheckpoint(
-            'checkpoints/model_epoch_{epoch:02d}.h5',
+            'checkpoints/model_epoch_{epoch:02d}.keras',
             save_freq='epoch'
         ),
-        callbacks.ReduceLROnPlateau(factor=0.1, patience=3),
-        callbacks.CSVLogger('training_log.csv')
+        callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.2,
+            patience=3,
+            min_lr=1e-7
+        ),
+        callbacks.CSVLogger('training_log.csv'),
+        callbacks.TensorBoard(log_dir='./logs')
     ]
 
-    print("\nStarting training... Press Ctrl+C to stop early and save progress.")
-    try:
-        history = model.fit(
-            train_dataset,
-            validation_data=val_dataset,
-            epochs=EPOCHS,
-            callbacks=callbacks_list,
-            verbose=1
-        )
-    except KeyboardInterrupt:
-        print("\nTraining interrupted by user. Saving current progress...")
-        model.save('interrupted_model.h5')
-        print("Model saved as 'interrupted_model.h5'")
-        return
+    print("\nPhase 1: Training top layers...")
+    history = model.fit(
+        train_dataset,
+        validation_data=val_dataset,
+        epochs=10,
+        callbacks=callbacks_list,
+        class_weight=class_weights
+    )
 
-    model.save('continent_classifier_final.h5')
-    print("\nTraining complete! Model saved as 'continent_classifier_final.h5'")
+    print("\nPhase 2: Fine-tuning base model...")
+    base_model.trainable = True
+    fine_tune_at = 100
+    for layer in base_model.layers[:fine_tune_at]:
+        layer.trainable = False
+
+    model.compile(
+        optimizer=optimizers.Adam(INITIAL_LR / 10),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    history = model.fit(
+        train_dataset,
+        validation_data=val_dataset,
+        initial_epoch=10,
+        epochs=EPOCHS,
+        callbacks=callbacks_list,
+        class_weight=class_weights
+    )
+
+    model.save('continent_classifier_final.keras')
+    print("\nModel saved as 'continent_classifier_final.keras'")
 
     plot_training_history(history)
+
+    visualize_predictions(model, val_dataset, label_encoder)
+
+
+def visualize_predictions(model, dataset, label_encoder):
+    plt.figure(figsize=(15, 10))
+    for images, labels in dataset.take(1):
+        predictions = model.predict(images)
+        for i in range(9):
+            plt.subplot(3, 3, i + 1)
+            plt.imshow(images[i].numpy())
+            pred_label = label_encoder.inverse_transform([np.argmax(predictions[i])])[0]
+            true_label = label_encoder.inverse_transform([labels[i]])[0]
+            plt.title(f"Pred: {pred_label}\nTrue: {true_label}")
+            plt.axis('off')
+        plt.savefig('sample_predictions.png')
+        plt.show()
 
 
 if __name__ == '__main__':
