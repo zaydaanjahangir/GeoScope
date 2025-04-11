@@ -60,9 +60,9 @@ class Conv_Net(nn.Module):
         # Output: [batch_size, 512, 20, 20]
         self.pool5 = nn.MaxPool2d(kernel_size=2, stride=2)
 
-        # Output: [batch_size, 512, 20, 20]
+        # Output: [batch_size, 1024, 20, 20]
         self.conv6 = nn.Conv2d(in_channels=512, out_channels=1024, kernel_size=3, padding=1)
-        # Output: [batch_size, 512, 10, 10]
+        # Output: [batch_size, 1024, 10, 10]
         self.pool6 = nn.MaxPool2d(kernel_size=2, stride=2)
 
 
