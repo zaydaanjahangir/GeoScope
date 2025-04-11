@@ -4,7 +4,7 @@ import pandas as pd
 from PIL import Image
 import torchvision.transforms.v2 as transforms
 from torch.utils.data import Dataset, DataLoader
-from cnn import Conv_Net
+from baseline.cnn import Conv_Net
 from tqdm import tqdm
 
 

@@ -10,7 +10,7 @@ import torch.optim as optim
 import matplotlib.pyplot as plt
 import numpy as np
 from torch.utils.data import Dataset, DataLoader, random_split
-from cnn import *  
+from baseline.cnn import *  
 from tqdm import tqdm
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
