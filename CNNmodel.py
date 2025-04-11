@@ -1,117 +1,184 @@
 import os
 import pandas as pd
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from PIL import Image
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, models, optimizers, callbacks
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
+import matplotlib.pyplot as plt
+import kagglehub
+
+IMAGE_SIZE = (224, 224)
+BATCH_SIZE = 32
+EPOCHS = 30
+NUM_CLASSES = 7
+LEARNING_RATE = 0.001
 
 
-df = pd.read_csv("DATA DATA DATA")
+def download_kaggle_dataset():
+    print("Downloading dataset from Kaggle...")
+    try:
+        path = kagglehub.dataset_download("ayuseless/streetview-image-dataset")
+        print(f"Dataset downloaded to: {path}")
+        return path
+    except Exception as e:
+        print(f"Error downloading dataset: {e}")
+        raise
 
-label_encoder = LabelEncoder()
-df['continent_encoded'] = label_encoder.fit_transform(df['continent'])
 
-df['image_filename'] = df.index.astype(str) + ".png"
+def find_images_in_download(path, df):
+    image_files = []
+    for root, _, files in os.walk(path):
+        for file in files:
+            if file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                try:
+                    index = int(os.path.splitext(file)[0])
+                    image_files.append((index, os.path.join(root, file)))
+                except ValueError:
+                    continue
 
-train_df, val_df = train_test_split(df, test_size=0.2, stratify=df['continent_encoded'], random_state=42)
+    image_files.sort()
+    image_paths = [path for _, path in image_files]
+
+    print(f"\nFound {len(image_paths)} images in downloaded dataset")
+
+    if len(image_paths) < len(df):
+        print(f"Warning: More CSV entries ({len(df)}) than images ({len(image_paths)})")
+        df = df.iloc[:len(image_paths)].copy()
+
+    df['image_path'] = image_paths[:len(df)]
+
+    print(f"Matched {len(df)} images to CSV rows")
+    return df
 
 
-class GeoGuessrDataset(Dataset):
-    def __init__(self, dataframe, image_folder, transform=None):
-        self.dataframe = dataframe.reset_index(drop=True)
-        self.image_folder = image_folder
-        self.transform = transform
+def load_data(csv_path):
+    try:
+        df = pd.read_csv(csv_path)
+        print("\nData loaded successfully. First few rows:")
+        print(df.head())
 
-    def __len__(self):
-        return len(self.dataframe)
+        kaggle_path = download_kaggle_dataset()
 
-    def __getitem__(self, idx):
-        row = self.dataframe.iloc[idx]
-        img_path = os.path.join(self.image_folder, row['image_filename'])
-        image = Image.open(img_path).convert("RGB")
-        if self.transform:
-            image = self.transform(image)
-        label = row['continent_encoded']
+        df = find_images_in_download(kaggle_path, df)
+
+        label_encoder = LabelEncoder()
+        df['continent_encoded'] = label_encoder.fit_transform(df['continent'])
+
+        print("\nClass distribution:")
+        print(df['continent'].value_counts())
+
+        return df, label_encoder
+
+    except Exception as e:
+        print(f"\nError in load_data(): {str(e)}")
+        raise
+
+
+def create_data_pipeline(df, image_size, batch_size, is_training=False):
+
+    def parse_image(filename, label):
+        image = tf.io.read_file(filename)
+        image = tf.image.decode_jpeg(image, channels=3)
+        image = tf.image.convert_image_dtype(image, tf.float32)
+        image = tf.image.resize(image, image_size)
         return image, label
 
+    def augment(image, label):
+        image = tf.image.random_flip_left_right(image)
+        image = tf.image.random_brightness(image, max_delta=0.2)
+        image = tf.image.random_contrast(image, lower=0.8, upper=1.2)
+        return image, label
+
+    filenames = df['image_path'].values
+    labels = df['continent_encoded'].values
+
+    dataset = tf.data.Dataset.from_tensor_slices((filenames, labels))
+
+    if is_training:
+        dataset = dataset.shuffle(buffer_size=len(df))
+
+    dataset = dataset.map(parse_image, num_parallel_calls=tf.data.AUTOTUNE)
+
+    if is_training:
+        dataset = dataset.map(augment, num_parallel_calls=tf.data.AUTOTUNE)
+
+    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 
-transform = transforms.Compose([
-    transforms.Resize((128, 128)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225])
-])
+def create_model(input_shape, num_classes):
+    base_model = tf.keras.applications.EfficientNetB0(
+        include_top=False,
+        weights='imagenet',
+        input_shape=input_shape
+    )
+    base_model.trainable = False
 
-train_dataset = GeoGuessrDataset(train_df, "images", transform)
-val_dataset = GeoGuessrDataset(val_df, "images", transform)
+    inputs = layers.Input(shape=input_shape)
+    x = base_model(inputs, training=False)
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(256, activation='relu')(x)
+    x = layers.Dropout(0.5)(x)
+    outputs = layers.Dense(num_classes, activation='softmax')(x)
 
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
-
-
-
-class GeoCNN(nn.Module):
-    def __init__(self, num_classes=7):
-        super(GeoCNN, self).__init__()
-        self.conv1 = nn.Conv2d(3, 16, 3, padding=1)
-        self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
-        self.conv3 = nn.Conv2d(32, 64, 3, padding=1)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.fc1 = nn.Linear(64 * 16 * 16, 256)
-        self.fc2 = nn.Linear(256, num_classes)
-
-    def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = self.pool(F.relu(self.conv3(x)))
-        x = x.view(-1, 64 * 16 * 16)
-        x = F.relu(self.fc1(x))
-        x = self.fc2(x)
-        return x
+    return models.Model(inputs, outputs)
 
 
+def main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    csv_path = os.path.join(script_dir, 'data', 'coordinates_with_continents_mapbox.csv')
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Script directory: {script_dir}")
+    print(f"CSV path: {csv_path}")
 
-model = GeoCNN(num_classes=len(label_encoder.classes_)).to(device)
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV file not found at: {csv_path}")
 
-for epoch in range(10):
-    model.train()
-    running_loss = 0.0
-    for images, labels in train_loader:
-        images, labels = images.to(device), labels.to(device)
+    df, label_encoder = load_data(csv_path)
 
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+    train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
 
-        running_loss += loss.item()
+    train_dataset = create_data_pipeline(train_df, IMAGE_SIZE, BATCH_SIZE, is_training=True)
+    val_dataset = create_data_pipeline(val_df, IMAGE_SIZE, BATCH_SIZE, is_training=False)
 
-    print(f"Epoch {epoch+1}, Loss: {running_loss/len(train_loader):.4f}")
+    model = create_model(IMAGE_SIZE + (3,), NUM_CLASSES)
+    model.compile(
+        optimizer=optimizers.Adam(LEARNING_RATE),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    callbacks_list = [
+        callbacks.EarlyStopping(patience=5, restore_best_weights=True),
+        callbacks.ModelCheckpoint('best_model.h5', save_best_only=True),
+        callbacks.ReduceLROnPlateau(factor=0.1, patience=3)
+    ]
+
+    print("\nStarting training...")
+    history = model.fit(
+        train_dataset,
+        validation_data=val_dataset,
+        epochs=EPOCHS,
+        callbacks=callbacks_list
+    )
+
+    model.save('continent_classifier.h5')
+    print("\nTraining complete! Model saved as 'continent_classifier.h5'")
+
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history['accuracy'], label='Train Accuracy')
+    plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+    plt.legend()
+    plt.title('Accuracy')
+
+    plt.subplot(1, 2, 2)
+    plt.plot(history.history['loss'], label='Train Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.legend()
+    plt.title('Loss')
+    plt.show()
 
 
-
-model.eval()
-correct = 0
-total = 0
-with torch.no_grad():
-    for images, labels in val_loader:
-        images, labels = images.to(device), labels.to(device)
-        outputs = model(images)
-        _, predicted = torch.max(outputs.data, 1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
-
-accuracy = 100 * correct / total
-print(f"Validation Accuracy: {accuracy:.2f}%")
-
-
+if __name__ == '__main__':
+    main()
