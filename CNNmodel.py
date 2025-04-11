@@ -65,15 +65,22 @@ def load_data(csv_path):
         label_encoder = LabelEncoder()
         df['continent_encoded'] = label_encoder.fit_transform(df['continent'])
 
+        unique_classes = df['continent'].unique()
+        num_classes = len(unique_classes)
         print("\nClass distribution:")
         print(df['continent'].value_counts())
+        print(f"\nUnique classes: {unique_classes}")
+        print(f"Number of classes: {num_classes}")
 
-        return df, label_encoder
+        max_label = df['continent_encoded'].max()
+        if max_label >= num_classes:
+            raise ValueError(f"Invalid label encoding: max label {max_label} >= num_classes {num_classes}")
+
+        return df, label_encoder, num_classes
 
     except Exception as e:
         print(f"\nError in load_data(): {str(e)}")
         raise
-
 
 def create_data_pipeline(df, image_size, batch_size, is_training=False):
 
@@ -125,6 +132,8 @@ def create_model(input_shape, num_classes):
 
 
 def main():
+
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
     csv_path = os.path.join(script_dir, 'data', 'coordinates_with_continents_mapbox.csv')
 
@@ -133,8 +142,11 @@ def main():
 
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"CSV file not found at: {csv_path}")
+    df, label_encoder, num_classes = load_data(csv_path)
 
-    df, label_encoder = load_data(csv_path)
+    NUM_CLASSES = num_classes
+    print(f"\nSetting NUM_CLASSES to: {NUM_CLASSES}")
+#    df, label_encoder = load_data(csv_path)
 
     train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
 
