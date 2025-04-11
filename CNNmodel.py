@@ -11,7 +11,6 @@ import kagglehub
 IMAGE_SIZE = (224, 224)
 BATCH_SIZE = 32
 EPOCHS = 30
-NUM_CLASSES = 7
 LEARNING_RATE = 0.001
 
 
@@ -59,7 +58,6 @@ def load_data(csv_path):
         print(df.head())
 
         kaggle_path = download_kaggle_dataset()
-
         df = find_images_in_download(kaggle_path, df)
 
         label_encoder = LabelEncoder()
@@ -82,8 +80,8 @@ def load_data(csv_path):
         print(f"\nError in load_data(): {str(e)}")
         raise
 
-def create_data_pipeline(df, image_size, batch_size, is_training=False):
 
+def create_data_pipeline(df, image_size, batch_size, is_training=False):
     def parse_image(filename, label):
         image = tf.io.read_file(filename)
         image = tf.image.decode_jpeg(image, channels=3)
@@ -131,52 +129,7 @@ def create_model(input_shape, num_classes):
     return models.Model(inputs, outputs)
 
 
-def main():
-
-
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    csv_path = os.path.join(script_dir, 'data', 'coordinates_with_continents_mapbox.csv')
-
-    print(f"Script directory: {script_dir}")
-    print(f"CSV path: {csv_path}")
-
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"CSV file not found at: {csv_path}")
-    df, label_encoder, num_classes = load_data(csv_path)
-
-    NUM_CLASSES = num_classes
-    print(f"\nSetting NUM_CLASSES to: {NUM_CLASSES}")
-#    df, label_encoder = load_data(csv_path)
-
-    train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
-
-    train_dataset = create_data_pipeline(train_df, IMAGE_SIZE, BATCH_SIZE, is_training=True)
-    val_dataset = create_data_pipeline(val_df, IMAGE_SIZE, BATCH_SIZE, is_training=False)
-
-    model = create_model(IMAGE_SIZE + (3,), NUM_CLASSES)
-    model.compile(
-        optimizer=optimizers.Adam(LEARNING_RATE),
-        loss='sparse_categorical_crossentropy',
-        metrics=['accuracy']
-    )
-
-    callbacks_list = [
-        callbacks.EarlyStopping(patience=5, restore_best_weights=True),
-        callbacks.ModelCheckpoint('best_model.h5', save_best_only=True),
-        callbacks.ReduceLROnPlateau(factor=0.1, patience=3)
-    ]
-
-    print("\nStarting training...")
-    history = model.fit(
-        train_dataset,
-        validation_data=val_dataset,
-        epochs=EPOCHS,
-        callbacks=callbacks_list
-    )
-
-    model.save('continent_classifier.h5')
-    print("\nTraining complete! Model saved as 'continent_classifier.h5'")
-
+def plot_training_history(history):
     plt.figure(figsize=(12, 4))
     plt.subplot(1, 2, 1)
     plt.plot(history.history['accuracy'], label='Train Accuracy')
@@ -189,7 +142,73 @@ def main():
     plt.plot(history.history['val_loss'], label='Validation Loss')
     plt.legend()
     plt.title('Loss')
+    plt.savefig('training_history.png')
     plt.show()
+
+
+def main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    csv_path = os.path.join(script_dir, 'data', 'coordinates_with_continents_mapbox.csv')
+
+    print(f"Script directory: {script_dir}")
+    print(f"CSV path: {csv_path}")
+
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV file not found at: {csv_path}")
+
+    df, label_encoder, num_classes = load_data(csv_path)
+    print(f"\nSetting NUM_CLASSES to: {num_classes}")
+
+    train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
+
+    train_dataset = create_data_pipeline(train_df, IMAGE_SIZE, BATCH_SIZE, is_training=True)
+    val_dataset = create_data_pipeline(val_df, IMAGE_SIZE, BATCH_SIZE, is_training=False)
+
+    model = create_model(IMAGE_SIZE + (3,), num_classes)
+    model.compile(
+        optimizer=optimizers.Adam(LEARNING_RATE),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    # Create checkpoint directory if it doesn't exist
+    os.makedirs('checkpoints', exist_ok=True)
+
+    callbacks_list = [
+        callbacks.EarlyStopping(patience=5, restore_best_weights=True),
+        callbacks.ModelCheckpoint(
+            'checkpoints/best_model.h5',
+            save_best_only=True,
+            monitor='val_accuracy',
+            mode='max'
+        ),
+        callbacks.ModelCheckpoint(
+            'checkpoints/model_epoch_{epoch:02d}.h5',
+            save_freq='epoch'
+        ),
+        callbacks.ReduceLROnPlateau(factor=0.1, patience=3),
+        callbacks.CSVLogger('training_log.csv')
+    ]
+
+    print("\nStarting training... Press Ctrl+C to stop early and save progress.")
+    try:
+        history = model.fit(
+            train_dataset,
+            validation_data=val_dataset,
+            epochs=EPOCHS,
+            callbacks=callbacks_list,
+            verbose=1
+        )
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user. Saving current progress...")
+        model.save('interrupted_model.h5')
+        print("Model saved as 'interrupted_model.h5'")
+        return
+
+    model.save('continent_classifier_final.h5')
+    print("\nTraining complete! Model saved as 'continent_classifier_final.h5'")
+
+    plot_training_history(history)
 
 
 if __name__ == '__main__':
