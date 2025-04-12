@@ -11,12 +11,18 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 from PIL import Image
 import kagglehub
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
 
-IMG_SIZE = (320, 320)
-BATCH_SIZE = 32
-EPOCHS = 10
+# Constants
+IMG_SIZE = (640, 640)
+BATCH_SIZE = 16
+EPOCHS = 1
 NUM_CLASSES = 7
 LEARNING_RATE = 0.0001
+TEST_SPLIT = 0.1
+plt.style.use('ggplot')
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 
 
@@ -103,6 +109,8 @@ class GeoKnowr(nn.Module):
         coord_out = self.coord_head(x)
 
         return continent_out, coord_out
+
+
 class GeoDataset(Dataset):
     def __init__(self, df, transform=None):
         self.df = df
@@ -126,13 +134,8 @@ class GeoDataset(Dataset):
 
 def prepare_data(csv_path, image_dir):
     try:
-        # Load CSV data
         df = pd.read_csv(csv_path)
         print(f"Found {len(df)} entries in CSV")
-
-        # Verify the image directory exists
-        if not os.path.exists(image_dir):
-            raise FileNotFoundError(f"Image directory not found: {image_dir}")
 
         image_paths = []
         for i, row in df.iterrows():
@@ -148,7 +151,7 @@ def prepare_data(csv_path, image_dir):
                     image_paths.append(path)
                     break
             else:
-                image_paths.append("")  # Mark as missing
+                image_paths.append("")
 
         df['image_path'] = image_paths
         df['image_exists'] = df['image_path'].apply(lambda x: os.path.exists(x) if x else False)
@@ -163,7 +166,6 @@ def prepare_data(csv_path, image_dir):
                 print(f"Sample files in directory: {sample_files}")
             except Exception as e:
                 print(f"Could not list directory contents: {str(e)}")
-
             raise ValueError("No matching images found. Please check the image naming pattern.")
 
         df = df[df['image_exists']].copy()
@@ -175,7 +177,17 @@ def prepare_data(csv_path, image_dir):
         coords = df[['latitude', 'longitude']].values
         df[['lat_norm', 'lon_norm']] = scaler.fit_transform(coords)
 
-        return df, le, scaler
+        # Split into train/val/test
+        train_df = df.sample(frac=0.7, random_state=42)  # 70% train
+        val_df = df.drop(train_df.index).sample(frac=0.67, random_state=42)  # 20% val
+        test_df = df.drop(train_df.index).drop(val_df.index)  # 10% test
+
+        print("\nData split:")
+        print(f"- Training samples: {len(train_df)}")
+        print(f"- Validation samples: {len(val_df)}")
+        print(f"- Test samples: {len(test_df)}")
+
+        return train_df, val_df, test_df, le, scaler
 
     except Exception as e:
         print(f"Error in prepare_data: {str(e)}")
@@ -191,6 +203,56 @@ def get_transforms():
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
+
+
+def evaluate_test(model, test_loader, le):
+    model.eval()
+    test_loss = 0.0
+    correct = 0
+    total = 0
+    all_preds = []
+    all_true = []
+
+    criterion_cls = nn.CrossEntropyLoss()
+    criterion_reg = nn.HuberLoss()
+
+    with torch.no_grad():
+        for images, (continents, coords) in tqdm(test_loader, desc="Testing"):
+            images = images.to(DEVICE)
+            continents = continents.long().to(DEVICE)
+            coords = coords.to(DEVICE)
+
+            continent_pred, coord_pred = model(images)
+            loss_cls = criterion_cls(continent_pred, continents)
+            loss_reg = criterion_reg(coord_pred, coords)
+            test_loss += 0.6 * loss_cls.item() + 0.4 * loss_reg.item()
+
+            _, predicted = torch.max(continent_pred.data, 1)
+            total += continents.size(0)
+            correct += (predicted == continents).sum().item()
+
+            all_preds.extend(predicted.cpu().numpy())
+            all_true.extend(continents.cpu().numpy())
+
+    test_acc = 100 * correct / total
+    print(f"\nTest Accuracy: {test_acc:.2f}%")
+    print(f"Test Loss: {test_loss / len(test_loader):.4f}")
+
+    # Plot confusion matrix
+    plt.figure(figsize=(10, 8))
+    cm = confusion_matrix(all_true, all_preds)
+    sns.heatmap(cm, annot=True, fmt='d',
+                xticklabels=le.classes_,
+                yticklabels=le.classes_,
+                cmap='Blues')
+    plt.title('Confusion Matrix')
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.tight_layout()
+    plt.savefig('confusion_matrix.png')
+    plt.close()
+
+    return test_acc
 
 
 def train():
@@ -214,7 +276,7 @@ def train():
 
         csv_path = os.path.join("data", "coordinates_with_continents_mapbox.csv")
         if not os.path.exists(csv_path):
-            csv_path = "coordinates_with_continents_mapbox.csv"  # Try current directory
+            csv_path = "coordinates_with_continents_mapbox.csv"
 
         print("\nVerifying paths:")
         print(f"CSV path: {os.path.abspath(csv_path)}")
@@ -222,16 +284,15 @@ def train():
         print(f"Sample image files: {os.listdir(image_dir)[:5]}")
 
         print("\nPreparing data...")
-        df, le, scaler = prepare_data(csv_path, image_dir)
-
-        train_df = df.sample(frac=0.8, random_state=42)
-        val_df = df.drop(train_df.index)
+        train_df, val_df, test_df, le, scaler = prepare_data(csv_path, image_dir)
 
         train_dataset = GeoDataset(train_df, transform=get_transforms())
         val_dataset = GeoDataset(val_df, transform=get_transforms())
+        test_dataset = GeoDataset(test_df, transform=get_transforms())
 
         train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
 
         print("Initializing model...")
         model = GeoKnowr(num_classes=NUM_CLASSES).to(DEVICE)
@@ -243,14 +304,17 @@ def train():
         optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.0001)
 
         print("Starting training...")
+
+        # Store metrics for plotting
+        train_losses = []
+        val_losses = []
+        val_accuracies = []
+
         for epoch in range(EPOCHS):
             model.train()
-
-            train_pbar = tqdm(train_loader,
-                              desc=f"Epoch {epoch + 1}/{EPOCHS} [Train]",
-                              leave=False)
-
+            train_pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{EPOCHS} [Train]", leave=False)
             train_loss = 0.0
+
             for images, (continents, coords) in train_pbar:
                 images = images.to(DEVICE)
                 continents = continents.long().to(DEVICE)
@@ -267,21 +331,18 @@ def train():
                 optimizer.step()
 
                 train_loss += loss.item()
-
                 train_pbar.set_postfix({
                     "Loss": f"{loss.item():.4f}",
                     "Avg Loss": f"{train_loss / (train_pbar.n + 1):.4f}"
                 })
 
+            # Validation
             model.eval()
             val_loss = 0.0
             correct = 0
             total = 0
 
-            val_pbar = tqdm(val_loader,
-                            desc=f"Epoch {epoch + 1}/{EPOCHS} [Val]",
-                            leave=False)
-
+            val_pbar = tqdm(val_loader, desc=f"Epoch {epoch + 1}/{EPOCHS} [Val]", leave=False)
             with torch.no_grad():
                 for images, (continents, coords) in val_pbar:
                     images = images.to(DEVICE)
@@ -302,29 +363,61 @@ def train():
                         "Val Loss": f"{val_loss / (val_pbar.n + 1):.4f}"
                     })
 
+            # Store epoch metrics
+            train_losses.append(train_loss / len(train_loader))
+            val_losses.append(val_loss / len(val_loader))
+            val_accuracies.append(100 * correct / total)
+
             print(f"\nEpoch {epoch + 1}/{EPOCHS} Summary:")
-            print(f"Train Loss: {train_loss / len(train_loader):.4f}")
-            print(f"Val Loss: {val_loss / len(val_loader):.4f}")
-            print(f"Val Accuracy: {100 * correct / total:.2f}%")
+            print(f"Train Loss: {train_losses[-1]:.4f}")
+            print(f"Val Loss: {val_losses[-1]:.4f}")
+            print(f"Val Accuracy: {val_accuracies[-1]:.2f}%")
             print("-" * 50)
 
+        # Plot training curves
+        plt.figure(figsize=(15, 5))
+        plt.subplot(1, 2, 1)
+        plt.plot(train_losses, 'b-o', label='Train Loss')
+        plt.plot(val_losses, 'r-o', label='Val Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+
+        plt.subplot(1, 2, 2)
+        plt.plot(val_accuracies, 'g-o', label='Val Accuracy')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy (%)')
+        plt.legend()
+
+        plt.tight_layout()
+        plt.savefig('training_curves.png')
+        plt.close()
+
+        # Test evaluation
+        test_acc = evaluate_test(model, test_loader, le)
+
+        # Save model
         torch.save({
             'model_state_dict': model.state_dict(),
             'le_classes': le.classes_,
             'scaler_mean': scaler.mean_,
-            'scaler_scale': scaler.scale_
-        }, "geoknowr_pytorch.pth")
+            'scaler_scale': scaler.scale_,
+            'test_accuracy': test_acc,
+            'training_metrics': {
+                'train_loss': train_losses,
+                'val_loss': val_losses,
+                'val_acc': val_accuracies
+            }
+        }, "geoknowr_model.pth")
 
-        print("Training complete and model saved!")
-
+        print("\nTraining complete!")
+        print(f"Final Test Accuracy: {test_acc:.2f}%")
+        print("Visualizations saved:")
+        print("- confusion_matrix.png")
+        print("- training_curves.png")
 
     except Exception as e:
         print(f"\nError during training: {str(e)}")
-        print("\nTroubleshooting tips:")
-        print("1. Check if the dataset contains images by running:")
-        print(f"   ls -la {dataset_path}/*")
-        print("2. Verify your CSV file exists at:", os.path.abspath(csv_path))
-        print("3. The Kaggle dataset might have changed its structure")
         raise
 
 
