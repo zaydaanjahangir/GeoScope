@@ -4,7 +4,7 @@ from typing import Dict, List, Tuple, Optional
 import torch.nn.functional as F
 
 class StreetCLIP(torch.nn.Module):
-    """StreetCLIP model for geolocalization using CLIP."""
+    """StreetCLIP model for geolocalization using CLIP (head‑only fine‑tuning)."""
     
     def __init__(self, clip_model_version: str = "ViT-L/14"):
         """
@@ -17,11 +17,11 @@ class StreetCLIP(torch.nn.Module):
         # Load pretrained CLIP model
         self.clip_model, self.preprocess = clip.load(clip_model_version)
         
-        # Freeze CLIP parameters
-        # for param in self.clip_model.parameters():
-        #     param.requires_grad = False
+        # ───→ HEAD‑ONLY FINE‑TUNING: freeze the entire CLIP backbone
+        for param in self.clip_model.parameters():
+            param.requires_grad = False
             
-        # Add projection layer for vision representation
+        # Add projection layer for vision representation (this is the only trainable layer)
         self.vision_projection = torch.nn.Linear(
             self.clip_model.visual.output_dim,
             self.clip_model.visual.output_dim
@@ -29,29 +29,16 @@ class StreetCLIP(torch.nn.Module):
         
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
         """
-        Encode image using CLIP's image encoder.
-        
-        Args:
-            image: Image tensor
-            
-        Returns:
-            Image features
+        Encode image using CLIP's (now‑frozen) image encoder.
         """
         return self.clip_model.encode_image(image)
     
     def encode_text(self, text: List[str]) -> torch.Tensor:
         """
-        Encode text using CLIP's text encoder.
-        
-        Args:
-            text: List of text strings
-            
-        Returns:
-            Text features
+        Encode text using CLIP's (now‑frozen) text encoder.
         """
-        # Tokenize text
-        text_tokens = clip.tokenize(text).to(next(self.parameters()).device)
-        return self.clip_model.encode_text(text_tokens)
+        tokens = clip.tokenize(text).to(next(self.parameters()).device)
+        return self.clip_model.encode_text(tokens)
     
     def compute_loss(
         self, 
@@ -61,48 +48,35 @@ class StreetCLIP(torch.nn.Module):
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute the combined loss for StreetCLIP training.
-        
-        Args:
-            image_features: Image feature embeddings
-            text_features: Text feature embeddings
-            temperature: Temperature parameter for scaling logits
-            
-        Returns:
-            Tuple of (total loss, loss components dictionary)
         """
-        # Ensure consistent data types by converting to the same type as the vision projection layer
-        weight_dtype = self.vision_projection.weight.dtype
-        image_features = image_features.to(dtype=weight_dtype)
-        text_features = text_features.to(dtype=weight_dtype)
+        # Cast to projection head dtype
+        dtype = self.vision_projection.weight.dtype
+        image_features = image_features.to(dtype)
+        text_features  = text_features.to(dtype)
         
-        # Normalize features
+        # Normalize embeddings
         image_features = F.normalize(image_features, dim=-1)
-        text_features = F.normalize(text_features, dim=-1)
+        text_features  = F.normalize(text_features, dim=-1)
         
-        # Project image features for vision representation
-        projected_image_features = self.vision_projection(image_features)
-        projected_image_features = F.normalize(projected_image_features, dim=-1)
-        
-        # Compute GZSL loss (L_GZSL)
+        # 1) GZSL loss on frozen embeddings
         logits = (image_features @ text_features.T) / temperature
-        labels = torch.arange(len(image_features)).to(image_features.device)
+        labels = torch.arange(len(image_features), device=logits.device)
         gzsl_loss = F.cross_entropy(logits, labels)
         
-        # Compute vision representation loss (L_Vision Representation)
-        vision_logits = (projected_image_features @ text_features.T) / temperature
-        vision_loss = F.cross_entropy(vision_logits, labels)
+        # 2) Vision‑projection loss on trainable head
+        proj = self.vision_projection(image_features)
+        proj = F.normalize(proj, dim=-1)
+        vision_logits = (proj @ text_features.T) / temperature
+        vision_loss  = F.cross_entropy(vision_logits, labels)
         
-        # Combined loss (L_CLIP = 0.5 * (L_GZSL + L_Vision Representation))
-        total_loss = (gzsl_loss + vision_loss) / 2
-        
-        # Return loss components for logging
-        loss_components = {
-            'gzsl_loss': gzsl_loss.item(),
+        # Total = 0.5*(both)
+        total_loss = 0.5 * (gzsl_loss + vision_loss)
+        comps = {
+            'gzsl_loss':   gzsl_loss.item(),
             'vision_loss': vision_loss.item(),
-            'total_loss': total_loss.item()
+            'total_loss':  total_loss.item()
         }
-        
-        return total_loss, loss_components
+        return total_loss, comps
     
     def forward(
         self, 
@@ -110,24 +84,11 @@ class StreetCLIP(torch.nn.Module):
         texts: List[str]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass of the model.
-        
-        Args:
-            images: Batch of images
-            texts: List of text strings
-            
-        Returns:
-            Tuple of (image_features, text_features)
+        Forward pass (frozen encoders + head).
         """
-        image_features = self.encode_image(images)
-        text_features = self.encode_text(texts)
-        
-        # Ensure consistent data types
-        weight_dtype = self.vision_projection.weight.dtype
-        image_features = image_features.to(dtype=weight_dtype)
-        text_features = text_features.to(dtype=weight_dtype)
-        
-        return image_features, text_features
+        img_feats = self.encode_image(images)
+        txt_feats = self.encode_text(texts)
+        return img_feats, txt_feats
     
     def predict_location(
         self, 
@@ -137,59 +98,34 @@ class StreetCLIP(torch.nn.Module):
     ) -> Dict:
         """
         Predict location for a single image using hierarchical prediction.
-        
-        Args:
-            image: Input image
-            candidate_locations: List of candidate location dictionaries
-            hierarchical: Whether to use hierarchical prediction (country then city)
-            
-        Returns:
-            Predicted location dictionary
+        (Unchanged from your version.)
         """
         self.eval()
         with torch.no_grad():
-            # Encode image
             image_features = self.encode_image(image)
             image_features = F.normalize(image_features, dim=-1)
             
             if hierarchical:
-                # First predict country
+                # Country‑level
                 from ..utils.synthetic_caption import SyntheticCaptionGenerator
-                country_candidates = list(set(loc['country'] for loc in candidate_locations))
-                country_captions = [
-                    f"A photo in {country}." for country in country_candidates
-                ]
+                country_candidates = list({loc['country'] for loc in candidate_locations})
+                country_captions   = [f"A photo in {c}." for c in country_candidates]
+                country_feats      = self.encode_text(country_captions)
+                country_feats      = F.normalize(country_feats, dim=-1)
+                sim_c = (image_features @ country_feats.T).squeeze()
+                pred_country = country_candidates[sim_c.argmax().item()]
                 
-                country_features = self.encode_text(country_captions)
-                country_features = F.normalize(country_features, dim=-1)
-                country_similarities = (image_features @ country_features.T).squeeze()
-                pred_country_idx = country_similarities.argmax().item()
-                pred_country = country_candidates[pred_country_idx]
-                
-                # Then predict city within the country
-                city_candidates = [
-                    loc for loc in candidate_locations 
-                    if loc['country'] == pred_country
-                ]
-                city_captions = [
-                    f"A photo from {loc['city']}." for loc in city_candidates
-                ]
-                
-                city_features = self.encode_text(city_captions)
-                city_features = F.normalize(city_features, dim=-1)
-                city_similarities = (image_features @ city_features.T).squeeze()
-                pred_city_idx = city_similarities.argmax().item()
-                return city_candidates[pred_city_idx]
+                # City‑level
+                city_cands = [loc for loc in candidate_locations if loc['country']==pred_country]
+                city_caps  = [f"A photo from {loc['city']}." for loc in city_cands]
+                city_feats = self.encode_text(city_caps)
+                city_feats = F.normalize(city_feats, dim=-1)
+                sim_city   = (image_features @ city_feats.T).squeeze()
+                return city_cands[sim_city.argmax().item()]
             else:
-                # Non-hierarchical prediction (direct city prediction)
-                candidate_captions = [
-                    SyntheticCaptionGenerator.generate_caption(loc) 
-                    for loc in candidate_locations
-                ]
-                
-                text_features = self.encode_text(candidate_captions)
-                text_features = F.normalize(text_features, dim=-1)
-                
-                similarities = (image_features @ text_features.T).squeeze()
-                pred_idx = similarities.argmax().item()
-                return candidate_locations[pred_idx] 
+                # Flat city
+                caps = [SyntheticCaptionGenerator.generate_caption(loc) for loc in candidate_locations]
+                txt = self.encode_text(caps)
+                txt = F.normalize(txt, dim=-1)
+                sim = (image_features @ txt.T).squeeze()
+                return candidate_locations[sim.argmax().item()]
