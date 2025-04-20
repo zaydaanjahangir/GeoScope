@@ -37,9 +37,15 @@ def parse_args():
     parser.add_argument('--num_epochs', type=int, default=10,
                        help='Number of epochs to train')
     parser.add_argument('--learning_rate', type=float, default=1e-6,
-                       help='Learning rate')
+                       help='Base learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-4,
-                       help='Weight decay')
+                       help='Weight decay for optimizer')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=12,
+                       help='Accumulate gradients over this many steps')
+    parser.add_argument('--warmup_epochs', type=float, default=0.6,
+                       help='Fractional epochs to warm up learning rate')
+    parser.add_argument('--geo_eval_frequency', type=int, default=1,
+                       help='Evaluate geographic accuracy every N epochs')
     
     # Evaluation arguments
     parser.add_argument('--candidates_file', help='Path to candidates JSON file')
@@ -59,7 +65,8 @@ def main():
     
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+    torch.backends.cudnn.benchmark = True
+
     if args.mode == 'generate_captions':
         # Generate captions for CSV
         SyntheticCaptionGenerator.process_csv(
@@ -76,42 +83,44 @@ def main():
                 args.test_csv,
                 os.path.join(args.output_dir, 'test_with_captions.csv')
             )
-    
+
     elif args.mode == 'train':
-        # Initialize model
+        # Initialize model and move it to device *before* making optimizer
         model = StreetCLIP(clip_model_version=args.clip_model).to(device)
-        
-        # Create optimizer
+
+        # Create optimizer (now sees CUDA parameters)
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=args.learning_rate,
             weight_decay=args.weight_decay
         )
-        
-        # Create trainer
+
+        # Create trainer, passing all hyperparams
         trainer = StreetCLIPTrainer(
             model=model,
             optimizer=optimizer,
             device=device,
-            output_dir=args.output_dir
+            output_dir=args.output_dir,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            warmup_epochs=args.warmup_epochs
         )
-        
-        # Create dataloaders using train-test split if only train_csv is provided
+
+        # Build dataloaders
         if args.train_csv and not args.val_csv:
             train_dataloader, val_dataloader = create_train_test_split(
                 args.train_csv,
                 args.image_dir,
-                test_size=0.2,  # 20% for validation
+                test_size=0.2,
                 batch_size=args.batch_size
             )
         else:
-            # Use existing separate train/val files if provided
             train_dataloader = create_dataloader(
                 args.train_csv,
                 args.image_dir,
                 batch_size=args.batch_size
             )
-            
             val_dataloader = None
             if args.val_csv:
                 val_dataloader = create_dataloader(
@@ -119,47 +128,44 @@ def main():
                     args.image_dir,
                     batch_size=args.batch_size
                 )
-        
-        # Train model
+
+        # Launch training
         trainer.train(
             train_loader=train_dataloader,
             val_loader=val_dataloader,
-            num_epochs=args.num_epochs
+            num_epochs=args.num_epochs,
+            geo_eval_frequency=args.geo_eval_frequency
         )
-    
+
     elif args.mode == 'evaluate':
-        # Load model
+        # Load model + checkpoint
         model = StreetCLIP(clip_model_version=args.clip_model).to(device)
         if args.checkpoint_path:
-            checkpoint = torch.load(args.checkpoint_path)
-            model.load_state_dict(checkpoint['model_state_dict'])
-        
+            chk = torch.load(args.checkpoint_path, map_location=device)
+            model.load_state_dict(chk['model_state_dict'])
+
         # Create evaluator
         evaluator = StreetCLIPEvaluator(
             model=model,
             device=device,
             output_dir=args.output_dir
         )
-        
-        # Load candidates
+
+        # Load candidates and test dataloader
         candidates = load_candidates(args.candidates_file)
-        
-        # Create test dataloader
         test_dataloader = create_dataloader(
             args.test_csv,
             args.image_dir,
             batch_size=args.batch_size
         )
-        
-        # Evaluate model
+
+        # Evaluate and save metrics
         metrics = evaluator.evaluate(
             test_dataloader=test_dataloader,
             candidate_locations=candidates['locations']
         )
-        
-        # Save metrics
         with open(os.path.join(args.output_dir, 'metrics.json'), 'w') as f:
             json.dump(metrics, f, indent=4)
 
 if __name__ == '__main__':
-    main() 
+    main()

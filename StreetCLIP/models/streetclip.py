@@ -18,8 +18,8 @@ class StreetCLIP(torch.nn.Module):
         self.clip_model, self.preprocess = clip.load(clip_model_version)
         
         # Freeze CLIP parameters
-        for param in self.clip_model.parameters():
-            param.requires_grad = False
+        # for param in self.clip_model.parameters():
+        #     param.requires_grad = False
             
         # Add projection layer for vision representation
         self.vision_projection = torch.nn.Linear(

@@ -1,10 +1,12 @@
 import torch
 import torch.nn as nn
+from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 from typing import Dict, List, Optional, Tuple
 import logging
 from tqdm import tqdm
 import os
+import random
 from utils.synthetic_caption import SyntheticCaptionGenerator
 from utils.plotting import plot_training_metrics
 import json
@@ -24,17 +26,7 @@ class StreetCLIPTrainer:
         warmup_epochs: float = 0.6
     ):
         """
-        Initialize the trainer.
-        
-        Args:
-            model: StreetCLIP model
-            optimizer: Optimizer for training
-            device: Device to train on
-            output_dir: Directory to save checkpoints
-            learning_rate: Learning rate for training
-            weight_decay: Weight decay for optimizer
-            gradient_accumulation_steps: Number of gradient accumulation steps
-            warmup_epochs: Number of warmup epochs
+        Initialize trainer: attempt to enable CLIP checkpointing if available, always set up AMP.
         """
         self.model = model
         self.optimizer = optimizer
@@ -44,11 +36,9 @@ class StreetCLIPTrainer:
         self.weight_decay = weight_decay
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.warmup_epochs = warmup_epochs
-        
-        # Create output directory
+
+        # Setup logging EARLY so we can warn
         os.makedirs(output_dir, exist_ok=True)
-        
-        # Setup logging
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
@@ -58,7 +48,24 @@ class StreetCLIPTrainer:
             ]
         )
         self.logger = logging.getLogger(__name__)
+
+        # Try to enable gradient checkpointing in CLIP’s visual transformer
+        try:
+            self.model.clip_model.visual.gradient_checkpointing_enable()
+            self.logger.info("Enabled gradient checkpointing on CLIP visual transformer.")
+        except Exception:
+            self.logger.warning(
+                " CLIP visual transformer has no gradient_checkpointing_enable(); skipping checkpointing."
+            )
+
+        # AMP GradScaler for mixed‐precision
+        self.scaler = GradScaler()
+
+
+
         
+        
+
     def train_epoch(
         self,
         train_loader: DataLoader,
@@ -66,95 +73,225 @@ class StreetCLIPTrainer:
         total_epochs: int
     ) -> Dict[str, float]:
         """
-        Train for one epoch.
-        
-        Args:
-            train_loader: Training data loader
-            epoch: Current epoch number
-            total_epochs: Total number of epochs
-            
-        Returns:
-            Dictionary of training metrics
+        One epoch of training with mixed‐precision and gradient clipping.
         """
         self.model.train()
-        total_loss = 0
-        total_gzsl_loss = 0
-        total_vision_loss = 0
+        total_loss = total_gzsl_loss = total_vision_loss = 0.0
         num_batches = len(train_loader)
-        
-        # Setup progress bar
         pbar = tqdm(train_loader, desc=f'Epoch {epoch}/{total_epochs}')
-        
-        # Initialize gradient accumulation
         self.optimizer.zero_grad()
-        
+
+        num_batches   = len(train_loader)
+        warmup_steps  = int(self.warmup_epochs * num_batches)  # e.g. 0.6*100 batches = 60 steps
+
         for batch_idx, batch in enumerate(pbar):
             images = batch['image'].to(self.device)
-            collated_metadata = batch['metadata'] # This is the collated dictionary
+            collated = batch['metadata']
             batch_size = images.size(0)
 
-            # Reconstruct individual metadata dictionaries for the batch
-            individual_metadata = [
+            # reconstruct metadata and captions
+            individual = [
+                {k: collated[k][i] for k in collated}
+                for i in range(batch_size)
+            ]
+            captions = [
+                SyntheticCaptionGenerator.generate_caption(md)
+                for md in individual
+            ]
+
+            # MIXED‑PRECISION FORWARD
+            with autocast():
+                img_feats, txt_feats = self.model(images, captions)
+                loss, comps = self.model.compute_loss(img_feats, txt_feats)
+                loss = loss / self.gradient_accumulation_steps
+
+            # SCALED BACKWARD
+            self.scaler.scale(loss).backward()
+
+            # STEP + CLIP every gradient_accumulation_steps
+            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                # unscale grads for clipping
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+                # warmup LR
+                if epoch <= self.warmup_epochs:
+                    total_steps = self.warmup_epochs * num_batches
+                    current_step = (epoch - 1) * num_batches + (batch_idx + 1)
+                    factor = min(1.0, current_step / total_steps)
+                    for pg in self.optimizer.param_groups:
+                        pg['lr'] = self.learning_rate * factor
+
+                # step + update scaler
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad()
+
+            # accumulate metrics
+            total_loss        += comps['total_loss']
+            total_gzsl_loss   += comps['gzsl_loss']
+            total_vision_loss += comps['vision_loss']
+
+            pbar.set_postfix({
+                'loss':        total_loss        / (batch_idx + 1),
+                'gzsl_loss':   total_gzsl_loss   / (batch_idx + 1),
+                'vision_loss': total_vision_loss / (batch_idx + 1),
+            })
+
+        return {
+            'loss':        total_loss        / num_batches,
+            'gzsl_loss':   total_gzsl_loss   / num_batches,
+            'vision_loss': total_vision_loss / num_batches,
+        }
+    
+    def generate_candidate_locations(self, dataloader: DataLoader, max_candidates: int = 100) -> List[Dict]:
+        """
+        Generate candidate locations from the dataloader.
+        
+        Args:
+            dataloader: DataLoader containing location data
+            max_candidates: Maximum number of candidate locations to generate
+            
+        Returns:
+            List of candidate locations
+        """
+        self.logger.info("Generating candidate locations for geographic evaluation...")
+        all_locations = set()
+        location_metadata = []
+        
+        # Collect unique locations
+        for batch in tqdm(dataloader, desc="Collecting locations"):
+            collated_metadata = batch['metadata']
+            batch_size = len(next(iter(collated_metadata.values())))
+            
+            # Reconstruct individual metadata dictionaries
+            metadata_list = [
                 {key: collated_metadata[key][i] for key in collated_metadata}
                 for i in range(batch_size)
             ]
             
-            # Generate synthetic captions using the reconstructed list
-            captions = [
-                SyntheticCaptionGenerator.generate_caption(meta)
-                for meta in individual_metadata
-            ]
+            for metadata in metadata_list:
+                location_key = (
+                    metadata.get('city', ''), 
+                    metadata.get('country', ''),
+                    metadata.get('continent', '')
+                )
+                if location_key not in all_locations:
+                    all_locations.add(location_key)
+                    location_metadata.append({
+                        'city': metadata.get('city', ''),
+                        'region': metadata.get('region', ''),
+                        'country': metadata.get('country', ''),
+                        'continent': metadata.get('continent', '')
+                    })
+        
+        # Sample candidates if we have more than max_candidates
+        candidates = location_metadata
+        if len(candidates) > max_candidates:
+            candidates = random.sample(candidates, max_candidates)
+        
+        self.logger.info(f"Generated {len(candidates)} candidate locations")
+        return candidates
+    
+    def evaluate_geographic_accuracy(
+        self, 
+        val_loader: DataLoader,
+        candidates: List[Dict]
+    ) -> Dict[str, float]:
+        """
+        Evaluate geographic accuracy on validation data.
+        
+        Args:
+            val_loader: Validation data loader
+            candidates: List of candidate locations
             
-            # Forward pass
-            image_features, text_features = self.model(images, captions)
-            
-            # Compute loss
-            loss, loss_components = self.model.compute_loss(image_features, text_features)
-            
-            # Scale loss for gradient accumulation
-            loss = loss / self.gradient_accumulation_steps
-            
-            # Backward pass
-            loss.backward()
-            
-            # Update weights if gradient accumulation is complete
-            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
-                # Apply learning rate warmup
-                if epoch < self.warmup_epochs:
-                    warmup_factor = min(1.0, (epoch * num_batches + batch_idx + 1) / 
-                                     (self.warmup_epochs * num_batches))
-                    for param_group in self.optimizer.param_groups:
-                        param_group['lr'] = self.learning_rate * warmup_factor
+        Returns:
+            Dictionary with accuracy metrics
+        """
+        self.logger.info("Evaluating geographic accuracy...")
+        self.model.eval()
+        
+        total_samples = 0
+        correct_country = 0
+        correct_city = 0
+        correct_continent = 0
+        
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc="Evaluating geography"):
+                images = batch['image'].to(self.device)
+                collated_metadata = batch['metadata']
+                batch_size = images.size(0)
                 
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-            
-            # Update metrics
-            total_loss += loss_components['total_loss']
-            total_gzsl_loss += loss_components['gzsl_loss']
-            total_vision_loss += loss_components['vision_loss']
-            
-            # Update progress bar
-            pbar.set_postfix({
-                'loss': total_loss / (batch_idx + 1),
-                'gzsl_loss': total_gzsl_loss / (batch_idx + 1),
-                'vision_loss': total_vision_loss / (batch_idx + 1)
-            })
+                # Reconstruct individual metadata dictionaries
+                individual_metadata = [
+                    {key: collated_metadata[key][i] for key in collated_metadata}
+                    for i in range(batch_size)
+                ]
+                
+                # Get image features
+                for i, image in enumerate(images):
+                    metadata = individual_metadata[i]
+                    
+                    # Skip samples with missing metadata
+                    if not (metadata.get('country') and metadata.get('city') and metadata.get('continent')):
+                        continue
+                    
+                    # Encode image
+                    image_features = self.model.encode_image(image.unsqueeze(0))
+                    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+                    
+                    # For each candidate location, create a caption and encode it
+                    captions = [
+                        SyntheticCaptionGenerator.generate_caption(candidate)
+                        for candidate in candidates
+                    ]
+                    text_features = self.model.encode_text(captions)
+                    text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                    
+                    # Calculate similarities and get prediction
+                    similarities = (image_features @ text_features.T).squeeze()
+                    pred_idx = similarities.argmax().item()
+                    prediction = candidates[pred_idx]
+                    
+                    # Update counters
+                    total_samples += 1
+                    if prediction['continent'] == metadata['continent']:
+                        correct_continent += 1
+                    if prediction['country'] == metadata['country']:
+                        correct_country += 1
+                    if prediction['city'] == metadata['city']:
+                        correct_city += 1
         
-        # Compute average metrics
-        metrics = {
-            'loss': total_loss / num_batches,
-            'gzsl_loss': total_gzsl_loss / num_batches,
-            'vision_loss': total_vision_loss / num_batches
+        # Calculate accuracies
+        if total_samples == 0:
+            self.logger.warning("No valid samples for geographic evaluation")
+            return {
+                'continent_accuracy': 0.0,
+                'country_accuracy': 0.0,
+                'city_accuracy': 0.0
+            }
+        
+        continent_accuracy = correct_continent / total_samples
+        country_accuracy = correct_country / total_samples
+        city_accuracy = correct_city / total_samples
+        
+        self.logger.info(f"Geographic Evaluation Results (on {total_samples} samples):")
+        self.logger.info(f"  Continent Accuracy: {continent_accuracy:.4f}")
+        self.logger.info(f"  Country Accuracy: {country_accuracy:.4f}")
+        self.logger.info(f"  City Accuracy: {city_accuracy:.4f}")
+        
+        return {
+            'continent_accuracy': continent_accuracy,
+            'country_accuracy': country_accuracy,
+            'city_accuracy': city_accuracy
         }
-        
-        return metrics
     
     def train(
         self,
         train_loader: DataLoader,
         val_loader: Optional[DataLoader] = None,
-        num_epochs: int = 3
+        num_epochs: int = 3,
+        geo_eval_frequency: int = 1  # Evaluate geographic accuracy every N epochs
     ) -> Dict[str, List[float]]:
         """
         Train the model.
@@ -163,6 +300,7 @@ class StreetCLIPTrainer:
             train_loader: Training data loader
             val_loader: Validation data loader
             num_epochs: Number of epochs to train
+            geo_eval_frequency: Frequency of geographic accuracy evaluation
             
         Returns:
             Dictionary of training history
@@ -172,11 +310,24 @@ class StreetCLIPTrainer:
             'train_gzsl_loss': [],
             'train_vision_loss': [],
             'val_loss': [],
+            'val_accuracy': [],
             'learning_rate': [],
-            'val_accuracy': []  # Added for plotting, even if not populated
+            # Geographic accuracy metrics that will be populated during evaluation
+            'country_accuracy': [],
+            'city_accuracy': [],
+            'continent_accuracy': []
         }
         
         best_val_loss = float('inf')
+        
+        # Generate candidate locations from validation set if available, otherwise from training set
+        candidates = None
+        if val_loader is not None:
+            candidates = self.generate_candidate_locations(val_loader)
+        else:
+            # Sample a subset of train_loader to generate candidates
+            # (avoiding using the same data for training and evaluation)
+            candidates = self.generate_candidate_locations(train_loader)
         
         for epoch in range(num_epochs):
             # Track current learning rate
@@ -203,9 +354,12 @@ class StreetCLIPTrainer:
             if val_loader is not None:
                 val_metrics = self.validate(val_loader)
                 val_loss = val_metrics['loss']
-                history['val_loss'].append(val_loss)
+                val_accuracy = val_metrics['accuracy']
                 
-                self.logger.info(f'Validation Loss: {val_loss:.4f}')
+                history['val_loss'].append(val_loss)
+                history['val_accuracy'].append(val_accuracy)
+                
+                self.logger.info(f'Validation Loss: {val_loss:.4f}, Accuracy: {val_accuracy:.4f}')
                 
                 # Save best model
                 if val_loss < best_val_loss:
@@ -215,6 +369,23 @@ class StreetCLIPTrainer:
                         epoch + 1,
                         val_loss
                     )
+                
+                # Evaluate geographic accuracy at specified frequency
+                if (epoch + 1) % geo_eval_frequency == 0 or epoch == num_epochs - 1:
+                    geo_metrics = self.evaluate_geographic_accuracy(val_loader, candidates)
+                    
+                    # Update history with current geo metrics
+                    history['continent_accuracy'].append(geo_metrics['continent_accuracy'])
+                    history['country_accuracy'].append(geo_metrics['country_accuracy'])
+                    history['city_accuracy'].append(geo_metrics['city_accuracy'])
+                    
+                    # Fill in missing values for previous epochs
+                    while len(history['continent_accuracy']) < epoch + 1:
+                        history['continent_accuracy'].insert(0, 0.0)
+                    while len(history['country_accuracy']) < epoch + 1:
+                        history['country_accuracy'].insert(0, 0.0)
+                    while len(history['city_accuracy']) < epoch + 1:
+                        history['city_accuracy'].insert(0, 0.0)
             
             # Save checkpoint after each epoch
             self.save_checkpoint(
@@ -222,6 +393,12 @@ class StreetCLIPTrainer:
                 epoch + 1,
                 val_loss if val_loader is not None else train_metrics['loss']
             )
+            
+            # Save and plot intermediate history
+            with open(os.path.join(self.output_dir, 'training_history.json'), 'w') as f:
+                json.dump(history, f, indent=4)
+            
+            plot_training_metrics(history, self.output_dir)
         
         # Save final model
         self.save_checkpoint(
@@ -230,11 +407,11 @@ class StreetCLIPTrainer:
             val_loss if val_loader is not None else train_metrics['loss']
         )
         
-        # Save training history
+        # Final save of training history
         with open(os.path.join(self.output_dir, 'training_history.json'), 'w') as f:
             json.dump(history, f, indent=4)
         
-        # Plot training metrics
+        # Plot final training metrics
         plot_training_metrics(history, self.output_dir)
         
         return history
@@ -254,6 +431,10 @@ class StreetCLIPTrainer:
         total_gzsl_loss = 0
         total_vision_loss = 0
         num_batches = len(val_loader)
+        
+        # For accuracy calculation
+        total_samples = 0
+        correct_predictions = 0
         
         with torch.no_grad():
             for batch in tqdm(val_loader, desc='Validating'):
@@ -283,12 +464,32 @@ class StreetCLIPTrainer:
                 total_loss += loss_components['total_loss']
                 total_gzsl_loss += loss_components['gzsl_loss']
                 total_vision_loss += loss_components['vision_loss']
+                
+                # Calculate accuracy (similarity-based)
+                # Normalize features
+                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                
+                # Calculate similarity matrix
+                similarities = (image_features @ text_features.T)
+                
+                # Get predictions (diagonal should be highest for correct matches)
+                predictions = torch.argmax(similarities, dim=1)
+                targets = torch.arange(len(predictions)).to(self.device)
+                
+                # Calculate correct predictions
+                correct = (predictions == targets).sum().item()
+                correct_predictions += correct
+                total_samples += len(predictions)
         
         # Compute average metrics
+        accuracy = correct_predictions / total_samples if total_samples > 0 else 0
+        
         metrics = {
             'loss': total_loss / num_batches,
             'gzsl_loss': total_gzsl_loss / num_batches,
-            'vision_loss': total_vision_loss / num_batches
+            'vision_loss': total_vision_loss / num_batches,
+            'accuracy': accuracy  # Add accuracy to validation metrics
         }
         
         return metrics

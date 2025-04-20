@@ -22,7 +22,7 @@ def plot_training_metrics(
     # Set up plot style
     plt.style.use('ggplot')
     
-    # Create a figure with multiple subplots
+    # Create a figure with multiple subplots for losses
     fig, axes = plt.subplots(2, 2, figsize=figsize)
     
     # Plot training and validation loss
@@ -49,11 +49,7 @@ def plot_training_metrics(
     ax = axes[1, 0]
     if 'val_accuracy' in history and len(history['val_accuracy']) > 0:
         ax.plot(epochs, history['val_accuracy'], 'c-', label='Validation Accuracy')
-    if 'country_accuracy' in history and len(history['country_accuracy']) > 0:
-        ax.plot(epochs, history['country_accuracy'], 'y-', label='Country Accuracy')
-    if 'city_accuracy' in history and len(history['city_accuracy']) > 0:
-        ax.plot(epochs, history['city_accuracy'], 'k-', label='City Accuracy')
-    ax.set_title('Accuracy Metrics')
+    ax.set_title('Validation Accuracy')
     ax.set_xlabel('Epochs')
     ax.set_ylabel('Accuracy')
     if ax.get_legend_handles_labels()[0]:  # Check if we have any labels
@@ -75,6 +71,30 @@ def plot_training_metrics(
     plt.savefig(os.path.join(output_dir, 'training_metrics.png'), dpi=300)
     plt.savefig(os.path.join(output_dir, 'training_metrics.pdf'))
     plt.close()
+    
+    # Create separate figure for geographical accuracy metrics if they exist
+    geo_metrics = []
+    if 'country_accuracy' in history and len(history['country_accuracy']) > 0:
+        geo_metrics.append(('country_accuracy', 'Country Accuracy', 'C0'))
+    if 'city_accuracy' in history and len(history['city_accuracy']) > 0:
+        geo_metrics.append(('city_accuracy', 'City Accuracy', 'C1'))
+    if 'continent_accuracy' in history and len(history['continent_accuracy']) > 0:
+        geo_metrics.append(('continent_accuracy', 'Continent Accuracy', 'C2'))
+    
+    if geo_metrics:
+        plt.figure(figsize=(10, 6))
+        for metric_key, metric_label, color in geo_metrics:
+            plt.plot(epochs, history[metric_key], color=color, label=metric_label)
+        
+        plt.title('Geographical Accuracy Metrics')
+        plt.xlabel('Epochs')
+        plt.ylabel('Accuracy')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'geographical_accuracy.png'), dpi=300)
+        plt.savefig(os.path.join(output_dir, 'geographical_accuracy.pdf'))
+        plt.close()
     
     print(f"Training metrics plots saved to {output_dir}")
 
@@ -128,5 +148,44 @@ def plot_evaluation_metrics(
     plt.savefig(os.path.join(output_dir, 'evaluation_metrics.png'), dpi=300)
     plt.savefig(os.path.join(output_dir, 'evaluation_metrics.pdf'))
     plt.close()
+    
+    # Create separate figures for geographical accuracy
+    geo_categories = {
+        'continent': [k for k in metrics.keys() if 'continent' in k.lower()],
+        'country': [k for k in metrics.keys() if 'country' in k.lower()], 
+        'city': [k for k in metrics.keys() if 'city' in k.lower()]
+    }
+    
+    for category, metrics_keys in geo_categories.items():
+        if not metrics_keys:
+            continue
+            
+        category_metrics = {k: metrics[k] for k in metrics_keys if k in metrics}
+        if not category_metrics:
+            continue
+            
+        plt.figure(figsize=(8, 5))
+        sorted_items = sorted(category_metrics.items(), key=lambda x: x[1])
+        labels, values = zip(*sorted_items)
+        
+        # Clean up labels for display
+        display_labels = [label.replace('_', ' ').replace('accuracy', '').strip() for label in labels]
+        if all(label == '' for label in display_labels):
+            display_labels = [label.replace('_', ' ') for label in labels]
+            
+        # Create bar chart
+        bars = plt.barh(display_labels, values, color=f'C{list(geo_categories.keys()).index(category)}')
+        
+        # Add value labels
+        for bar in bars:
+            width = bar.get_width()
+            plt.text(width * 1.01, bar.get_y() + bar.get_height()/2, f'{width:.4f}', va='center')
+            
+        plt.title(f'{category.capitalize()} Level Accuracy')
+        plt.xlabel('Accuracy')
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f'{category}_accuracy.png'), dpi=300)
+        plt.savefig(os.path.join(output_dir, f'{category}_accuracy.pdf'))
+        plt.close()
     
     print(f"Evaluation metrics plots saved to {output_dir}") 
