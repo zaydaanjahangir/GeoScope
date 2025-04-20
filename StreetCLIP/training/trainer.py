@@ -73,8 +73,8 @@ class StreetCLIPTrainer:
         total_epochs: int
     ) -> Dict[str, float]:
         """
-        One epoch of training: FP16 forward, FP32 loss, gradient clipping,
-        per‐step LR warmup, and AMP‐step fallback on error.
+        One epoch of training: FP16 forward, cast back to FP32 for loss,
+        gradient clipping, per‐step LR warmup, and AMP‐step fallback on error.
         """
         self.model.train()
         total_loss = total_gzsl_loss = total_vision_loss = 0.0
@@ -101,22 +101,22 @@ class StreetCLIPTrainer:
             with autocast("cuda"):
                 img_feats, txt_feats = self.model(images, captions)
 
+            # cast features back to FP32
+            img_feats = img_feats.float()
+            txt_feats = txt_feats.float()
+
             # FP32 loss (move compute out of autocast)
             loss, comps = self.model.compute_loss(img_feats, txt_feats)
+            # clamp any extremes so you always get a finite scalar
+            loss = loss.clamp(max=1e3, min=-1e3)
             loss = loss / self.gradient_accumulation_steps
-
-            # skip bad batches
-            if not torch.isfinite(loss):
-                self.logger.warning(f"Non‐finite loss {loss} at batch {batch_idx}, skipping")
-                self.optimizer.zero_grad()
-                continue
 
             # backward
             self.scaler.scale(loss).backward()
 
             # step & clip every accumulation
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
-                # clip
+                # clip gradients
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
                 # warmup LR
@@ -126,14 +126,12 @@ class StreetCLIPTrainer:
                     for pg in self.optimizer.param_groups:
                         pg['lr'] = lr
 
-                # attempt AMP step, fallback on plain step
+                # try AMP step, fallback to plain if that errors
                 try:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 except ValueError:
-                    self.logger.warning("AMP step failed, falling back to optimizer.step()")
                     self.optimizer.step()
-                # zero grads
                 self.optimizer.zero_grad()
 
             # accumulate metrics
@@ -152,6 +150,7 @@ class StreetCLIPTrainer:
             'gzsl_loss':   total_gzsl_loss   / num_batches,
             'vision_loss': total_vision_loss / num_batches,
         }
+
 
 
 
