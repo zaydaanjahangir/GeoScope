@@ -137,6 +137,13 @@ def main():
             geo_eval_frequency=args.geo_eval_frequency
         )
 
+        del trainer
+        del model
+        del optimizer
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+
     elif args.mode == 'evaluate':
         # Load model + checkpoint
         model = StreetCLIP(clip_model_version=args.clip_model).to(device)

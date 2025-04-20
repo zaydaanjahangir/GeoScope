@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 from typing import Dict, List, Optional, Tuple
 import logging
@@ -73,7 +73,8 @@ class StreetCLIPTrainer:
         total_epochs: int
     ) -> Dict[str, float]:
         """
-        One epoch of training with mixed‐precision and gradient clipping.
+        One epoch of training: FP16 forward, FP32 loss, gradient clipping,
+        per‐step LR warmup, and AMP‐step fallback on error.
         """
         self.model.train()
         total_loss = total_gzsl_loss = total_vision_loss = 0.0
@@ -81,50 +82,58 @@ class StreetCLIPTrainer:
         pbar = tqdm(train_loader, desc=f'Epoch {epoch}/{total_epochs}')
         self.optimizer.zero_grad()
 
-        num_batches   = len(train_loader)
-        warmup_steps  = int(self.warmup_epochs * num_batches)  # e.g. 0.6*100 batches = 60 steps
+        warmup_steps = max(1, int(self.warmup_epochs * num_batches))
 
         for batch_idx, batch in enumerate(pbar):
             images = batch['image'].to(self.device)
             collated = batch['metadata']
             batch_size = images.size(0)
 
-            # reconstruct metadata and captions
+            # build captions
             individual = [
                 {k: collated[k][i] for k in collated}
                 for i in range(batch_size)
             ]
-            captions = [
-                SyntheticCaptionGenerator.generate_caption(md)
-                for md in individual
-            ]
+            captions = [SyntheticCaptionGenerator.generate_caption(md)
+                        for md in individual]
 
-            # MIXED‑PRECISION FORWARD
-            with autocast():
+            # FP16 forward
+            with autocast("cuda"):
                 img_feats, txt_feats = self.model(images, captions)
-                loss, comps = self.model.compute_loss(img_feats, txt_feats)
-                loss = loss / self.gradient_accumulation_steps
 
-            # SCALED BACKWARD
+            # FP32 loss (move compute out of autocast)
+            loss, comps = self.model.compute_loss(img_feats, txt_feats)
+            loss = loss / self.gradient_accumulation_steps
+
+            # skip bad batches
+            if not torch.isfinite(loss):
+                self.logger.warning(f"Non‐finite loss {loss} at batch {batch_idx}, skipping")
+                self.optimizer.zero_grad()
+                continue
+
+            # backward
             self.scaler.scale(loss).backward()
 
-            # STEP + CLIP every gradient_accumulation_steps
+            # step & clip every accumulation
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
-                # unscale grads for clipping
-                self.scaler.unscale_(self.optimizer)
+                # clip
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
                 # warmup LR
-                if epoch <= self.warmup_epochs:
-                    total_steps = self.warmup_epochs * num_batches
-                    current_step = (epoch - 1) * num_batches + (batch_idx + 1)
-                    factor = min(1.0, current_step / total_steps)
+                current_step = (epoch - 1) * num_batches + (batch_idx + 1)
+                if current_step <= warmup_steps:
+                    lr = self.learning_rate * (current_step / warmup_steps)
                     for pg in self.optimizer.param_groups:
-                        pg['lr'] = self.learning_rate * factor
+                        pg['lr'] = lr
 
-                # step + update scaler
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                # attempt AMP step, fallback on plain step
+                try:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                except ValueError:
+                    self.logger.warning("AMP step failed, falling back to optimizer.step()")
+                    self.optimizer.step()
+                # zero grads
                 self.optimizer.zero_grad()
 
             # accumulate metrics
@@ -143,6 +152,9 @@ class StreetCLIPTrainer:
             'gzsl_loss':   total_gzsl_loss   / num_batches,
             'vision_loss': total_vision_loss / num_batches,
         }
+
+
+
     
     def generate_candidate_locations(self, dataloader: DataLoader, max_candidates: int = 100) -> List[Dict]:
         """
