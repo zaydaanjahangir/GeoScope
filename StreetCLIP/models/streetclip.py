@@ -4,91 +4,84 @@ from typing import Dict, List, Tuple, Optional
 import torch.nn.functional as F
 
 class StreetCLIP(torch.nn.Module):
-    """StreetCLIP model for geolocalization using CLIP (head‑only fine‑tuning)."""
+    """StreetCLIP model for geolocalization using CLIP."""
     
     def __init__(self, clip_model_version: str = "ViT-L/14"):
-        """
-        Initialize StreetCLIP model.
-        
-        Args:
-            clip_model_version: Version of CLIP model to use (default: ViT-L/14)
-        """
         super().__init__()
-        # Load pretrained CLIP model
+        # 1) Load pretrained CLIP
         self.clip_model, self.preprocess = clip.load(clip_model_version)
-        
-        # ───→ HEAD‑ONLY FINE‑TUNING: freeze the entire CLIP backbone
+
+        # 2) Freeze all CLIP weights by default
         for param in self.clip_model.parameters():
             param.requires_grad = False
-            
-        # Add projection layer for vision representation (this is the only trainable layer)
+
+        # 3) But unfreeze the last 2 transformer blocks + the final layer norm in the visual tower
+        visual = self.clip_model.visual
+        # `resblocks` is an nn.Sequential of the transformer blocks
+        resblocks = visual.transformer.resblocks  
+        for idx in (-1, -2):   
+            for p in resblocks[idx].parameters():
+                p.requires_grad = True
+
+        # Unfreeze the final norm (ln_post) as well
+        for p in visual.ln_post.parameters():
+            p.requires_grad = True
+
+        # 4) Your trainable projection head
         self.vision_projection = torch.nn.Linear(
-            self.clip_model.visual.output_dim,
-            self.clip_model.visual.output_dim
+            visual.output_dim,
+            visual.output_dim
         )
-        
+        # (vision_projection.parameters() are True by default)
+
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        """
-        Encode image using CLIP's (now‑frozen) image encoder.
-        """
         return self.clip_model.encode_image(image)
-    
+
     def encode_text(self, text: List[str]) -> torch.Tensor:
-        """
-        Encode text using CLIP's (now‑frozen) text encoder.
-        """
         tokens = clip.tokenize(text).to(next(self.parameters()).device)
         return self.clip_model.encode_text(tokens)
-    
+
     def compute_loss(
         self, 
         image_features: torch.Tensor, 
         text_features: torch.Tensor, 
         temperature: float = 0.07
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        Compute the combined loss for StreetCLIP training.
-        """
-        # Cast to projection head dtype
-        dtype = self.vision_projection.weight.dtype
-        image_features = image_features.to(dtype)
-        text_features  = text_features.to(dtype)
-        
-        # Normalize embeddings
+        # (same as before)
+        weight_dtype = self.vision_projection.weight.dtype
+        image_features = image_features.to(dtype=weight_dtype)
+        text_features  = text_features.to(dtype=weight_dtype)
+
         image_features = F.normalize(image_features, dim=-1)
-        text_features  = F.normalize(text_features, dim=-1)
-        
-        # 1) GZSL loss on frozen embeddings
+        text_features  = F.normalize(text_features,  dim=-1)
+
+        # project + normalize
+        proj_img = self.vision_projection(image_features)
+        proj_img = F.normalize(proj_img, dim=-1)
+
+        labels = torch.arange(len(image_features), device=image_features.device)
+
+        # GZSL loss
         logits = (image_features @ text_features.T) / temperature
-        labels = torch.arange(len(image_features), device=logits.device)
         gzsl_loss = F.cross_entropy(logits, labels)
-        
-        # 2) Vision‑projection loss on trainable head
-        proj = self.vision_projection(image_features)
-        proj = F.normalize(proj, dim=-1)
-        vision_logits = (proj @ text_features.T) / temperature
-        vision_loss  = F.cross_entropy(vision_logits, labels)
-        
-        # Total = 0.5*(both)
+
+        # vision‐head loss
+        vision_logits = (proj_img @ text_features.T) / temperature
+        vision_loss = F.cross_entropy(vision_logits, labels)
+
         total_loss = 0.5 * (gzsl_loss + vision_loss)
-        comps = {
+        return total_loss, {
             'gzsl_loss':   gzsl_loss.item(),
             'vision_loss': vision_loss.item(),
             'total_loss':  total_loss.item()
         }
-        return total_loss, comps
-    
-    def forward(
-        self, 
-        images: torch.Tensor, 
-        texts: List[str]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass (frozen encoders + head).
-        """
-        img_feats = self.encode_image(images)
-        txt_feats = self.encode_text(texts)
-        return img_feats, txt_feats
+
+    def forward(self, images: torch.Tensor, texts: List[str]):
+        img_f = self.encode_image(images)
+        txt_f = self.encode_text(texts)
+        # cast & return
+        wdt = self.vision_projection.weight.dtype
+        return img_f.to(wdt), txt_f.to(wdt)
     
     def predict_location(
         self, 

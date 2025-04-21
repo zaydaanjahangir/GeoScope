@@ -62,94 +62,118 @@ class StreetCLIPTrainer:
         self.scaler = GradScaler()
 
 
+def train_epoch(
+    self,
+    train_loader: DataLoader,
+    epoch: int,
+    total_epochs: int
+) -> Dict[str, float]:
+    """
+    One epoch of training with:
+      - FP16 forward
+      - FP32 loss computed inline with clamped logits
+      - gradient clipping
+      - per‐step LR warmup
+      - AMP‐step fallback
+    """
+    self.model.train()
+    total_loss = total_gzsl_loss = total_vision_loss = 0.0
+    num_batches = len(train_loader)
+    pbar = tqdm(train_loader, desc=f'Epoch {epoch}/{total_epochs}')
+    self.optimizer.zero_grad()
 
-        
-        
+    # how many steps to warm up over
+    warmup_steps = max(1, int(self.warmup_epochs * num_batches))
+    eps = 1e-6             # small number to avoid divide‐by‐zero
+    clamp_val = 20.0       # clamp logits to [−20, +20]
+    temperature = 0.07     # same as your compute_loss default
 
-    def train_epoch(
-        self,
-        train_loader: DataLoader,
-        epoch: int,
-        total_epochs: int
-    ) -> Dict[str, float]:
-        """
-        One epoch of training: FP16 forward, cast back to FP32 for loss,
-        gradient clipping, per‐step LR warmup, and AMP‐step fallback on error.
-        """
-        self.model.train()
-        total_loss = total_gzsl_loss = total_vision_loss = 0.0
-        num_batches = len(train_loader)
-        pbar = tqdm(train_loader, desc=f'Epoch {epoch}/{total_epochs}')
-        self.optimizer.zero_grad()
+    for batch_idx, batch in enumerate(pbar):
+        images = batch['image'].to(self.device)
+        collated = batch['metadata']
+        batch_size = images.size(0)
 
-        warmup_steps = max(1, int(self.warmup_epochs * num_batches))
+        # build captions
+        individual = [
+            {k: collated[k][i] for k in collated}
+            for i in range(batch_size)
+        ]
+        captions = [ SyntheticCaptionGenerator.generate_caption(md)
+                     for md in individual ]
 
-        for batch_idx, batch in enumerate(pbar):
-            images = batch['image'].to(self.device)
-            collated = batch['metadata']
-            batch_size = images.size(0)
+        # 1) FP16 forward
+        with autocast("cuda"):
+            img_feats, txt_feats = self.model(images, captions)
 
-            # build captions
-            individual = [
-                {k: collated[k][i] for k in collated}
-                for i in range(batch_size)
-            ]
-            captions = [SyntheticCaptionGenerator.generate_caption(md)
-                        for md in individual]
+        # 2) cast back to FP32
+        img_feats = img_feats.float()
+        txt_feats = txt_feats.float()
 
-            # FP16 forward
-            with autocast("cuda"):
-                img_feats, txt_feats = self.model(images, captions)
+        # 3) safe normalize
+        img_feats = img_feats / img_feats.norm(dim=-1, keepdim=True).clamp_min(eps)
+        txt_feats = txt_feats / txt_feats.norm(dim=-1, keepdim=True).clamp_min(eps)
 
-            # cast features back to FP32
-            img_feats = img_feats.float()
-            txt_feats = txt_feats.float()
+        # 4) project and normalize projected features
+        proj_img = self.model.vision_projection(img_feats)
+        proj_img = proj_img / proj_img.norm(dim=-1, keepdim=True).clamp_min(eps)
 
-            # FP32 loss (move compute out of autocast)
-            loss, comps = self.model.compute_loss(img_feats, txt_feats)
-            # clamp any extremes so you always get a finite scalar
-            loss = loss.clamp(max=1e3, min=-1e3)
-            loss = loss / self.gradient_accumulation_steps
+        # 5) build labels
+        labels = torch.arange(batch_size, device=self.device)
 
-            # backward
-            self.scaler.scale(loss).backward()
+        # 6) compute and clamp logits
+        logits = (img_feats @ txt_feats.T) / temperature
+        logits = logits.clamp(-clamp_val, clamp_val)
+        gzsl_loss = F.cross_entropy(logits, labels)
 
-            # step & clip every accumulation
-            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
-                # clip gradients
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        vision_logits = (proj_img @ txt_feats.T) / temperature
+        vision_logits = vision_logits.clamp(-clamp_val, clamp_val)
+        vision_loss = F.cross_entropy(vision_logits, labels)
 
-                # warmup LR
-                current_step = (epoch - 1) * num_batches + (batch_idx + 1)
-                if current_step <= warmup_steps:
-                    lr = self.learning_rate * (current_step / warmup_steps)
-                    for pg in self.optimizer.param_groups:
-                        pg['lr'] = lr
+        # 7) combined loss & scale for accumulation
+        loss = 0.5 * (gzsl_loss + vision_loss)
+        loss = loss / self.gradient_accumulation_steps
 
-                # try AMP step, fallback to plain if that errors
-                try:
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                except ValueError:
-                    self.optimizer.step()
-                self.optimizer.zero_grad()
+        # 8) backward
+        self.scaler.scale(loss).backward()
 
-            # accumulate metrics
-            total_loss        += comps['total_loss']
-            total_gzsl_loss   += comps['gzsl_loss']
-            total_vision_loss += comps['vision_loss']
+        # 9) step & clip every accumulation
+        if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+            # gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
-            pbar.set_postfix({
-                'loss':        total_loss        / (batch_idx + 1),
-                'gzsl_loss':   total_gzsl_loss   / (batch_idx + 1),
-                'vision_loss': total_vision_loss / (batch_idx + 1),
-            })
+            # per‐step LR warmup
+            current_step = (epoch - 1) * num_batches + (batch_idx + 1)
+            if current_step <= warmup_steps:
+                scale = current_step / warmup_steps
+                for pg in self.optimizer.param_groups:
+                    pg['lr'] = self.learning_rate * scale
 
-        return {
-            'loss':        total_loss        / num_batches,
-            'gzsl_loss':   total_gzsl_loss   / num_batches,
-            'vision_loss': total_vision_loss / num_batches,
-        }
+            # AMP step, or fallback to optimizer.step()
+            try:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            except ValueError:
+                self.optimizer.step()
+            self.optimizer.zero_grad()
+
+        # 10) accumulate for logging
+        total_loss        += loss.item() * self.gradient_accumulation_steps
+        total_gzsl_loss   += gzsl_loss.item()
+        total_vision_loss += vision_loss.item()
+
+        pbar.set_postfix({
+            'loss':        total_loss        / (batch_idx + 1),
+            'gzsl_loss':   total_gzsl_loss   / (batch_idx + 1),
+            'vision_loss': total_vision_loss / (batch_idx + 1),
+        })
+
+    return {
+        'loss':        total_loss        / num_batches,
+        'gzsl_loss':   total_gzsl_loss   / num_batches,
+        'vision_loss': total_vision_loss / num_batches,
+    }
+
+
 
 
 
