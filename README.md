@@ -2,7 +2,6 @@
 
 GeoScope is a deep learning framework for image geolocalization that employs CNN transfer learning and a CLIP-inspired vision-language model to classify street view images into geographic regions. 
 
-<!--
 GeoScope is a deep learning framework for image geolocalization. The project leverages two complementary approaches:
 
 - **CNN-Based Geolocalization:** Utilizing CNN architectures such as ResNet-18 and WideResNet via transfer learning, GeoScope classifies images into discrete geographic regions (e.g., regions or continents) using geotagged street view images.
@@ -27,7 +26,5 @@ GeoScope addresses the challenge of image geolocalization—a problem with criti
 - Haas, L., Alberti, S., & Skreta, M. (2023). Learning generalized zero-shot learners for open-domain image geolocalization.
 - Weyand, T., Kostrikov, I., & Philbin, J. (2016). PlaNet - Photo Geolocation with Convolutional Neural Networks.
 
-## License
 
-MIT License
--->
+
