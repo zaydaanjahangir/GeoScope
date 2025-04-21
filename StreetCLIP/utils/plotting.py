@@ -1,191 +1,120 @@
-import matplotlib.pyplot as plt
-import numpy as np
-import json
 import os
-from typing import Dict, List, Optional
+import matplotlib.pyplot as plt
+from typing import Dict, List, Tuple
+
 
 def plot_training_metrics(
     history: Dict[str, List[float]],
     output_dir: str,
-    figsize: tuple = (12, 9)
+    figsize: Tuple[int, int] = (12, 9)
 ) -> None:
-    """
-    Plot training metrics and save the plots to the output directory.
-    
-    Args:
-        history: Dictionary containing training metrics (train_loss, val_loss, etc.)
-        output_dir: Directory to save the plots
-        figsize: Size of the figures
-    """
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Set up plot style
-    plt.style.use('ggplot')
-    
-    # Create a figure with multiple subplots for losses
-    fig, axes = plt.subplots(2, 2, figsize=figsize)
-    
-    # Plot training and validation loss
-    ax = axes[0, 0]
+    plt.style.use('ggplot') 
+
     epochs = range(1, len(history['train_loss']) + 1)
-    ax.plot(epochs, history['train_loss'], 'b-', label='Training Loss')
-    if 'val_loss' in history and len(history['val_loss']) > 0:
-        ax.plot(epochs, history['val_loss'], 'r-', label='Validation Loss')
-    ax.set_title('Loss over Epochs')
-    ax.set_xlabel('Epochs')
-    ax.set_ylabel('Loss')
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+
+    ax = axes[0, 0]
+    ax.plot(epochs, history['train_loss'], label='Train Loss')
+    if history.get('val_loss'):
+        ax.plot(epochs, history['val_loss'], label='Val Loss')
+    ax.set(xlabel='Epochs', ylabel='Loss', title='Loss over Epochs')
     ax.legend()
-    
-    # Plot GZSL and vision loss components
+
     ax = axes[0, 1]
-    ax.plot(epochs, history['train_gzsl_loss'], 'g-', label='GZSL Loss')
-    ax.plot(epochs, history['train_vision_loss'], 'm-', label='Vision Loss')
-    ax.set_title('Loss Components over Epochs')
-    ax.set_xlabel('Epochs')
-    ax.set_ylabel('Loss')
+    ax.plot(epochs, history['train_gzsl_loss'], label='GZSL Loss')
+    ax.plot(epochs, history['train_vision_loss'], label='Vision Loss')
+    ax.set(xlabel='Epochs', ylabel='Loss', title='Loss Components')
     ax.legend()
-    
-    # Plot validation metrics if available
+
     ax = axes[1, 0]
-    if 'val_accuracy' in history and len(history['val_accuracy']) > 0:
-        ax.plot(epochs, history['val_accuracy'], 'c-', label='Validation Accuracy')
-    ax.set_title('Validation Accuracy')
-    ax.set_xlabel('Epochs')
-    ax.set_ylabel('Accuracy')
-    if ax.get_legend_handles_labels()[0]:  # Check if we have any labels
+    if history.get('val_accuracy'):
+        ax.plot(epochs, history['val_accuracy'], label='Val Accuracy')
+        ax.set(xlabel='Epochs', ylabel='Accuracy', title='Val Accuracy')
         ax.legend()
-    
-    # Plot learning rate if available
-    ax = axes[1, 1]
-    if 'learning_rate' in history and len(history['learning_rate']) > 0:
-        ax.plot(epochs, history['learning_rate'], 'r-')
-        ax.set_title('Learning Rate over Epochs')
-        ax.set_xlabel('Epochs')
-        ax.set_ylabel('Learning Rate')
     else:
-        # If learning rate isn't available, plot something else or leave blank
-        ax.set_title('Reserved for Future Metrics')
-    
-    # Adjust layout and save the figure
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'training_metrics.png'), dpi=300)
-    plt.savefig(os.path.join(output_dir, 'training_metrics.pdf'))
-    plt.close()
-    
-    # Create separate figure for geographical accuracy metrics if they exist
-    geo_metrics = []
-    if 'country_accuracy' in history and len(history['country_accuracy']) > 0:
-        geo_metrics.append(('country_accuracy', 'Country Accuracy', 'C0'))
-    if 'city_accuracy' in history and len(history['city_accuracy']) > 0:
-        geo_metrics.append(('city_accuracy', 'City Accuracy', 'C1'))
-    if 'continent_accuracy' in history and len(history['continent_accuracy']) > 0:
-        geo_metrics.append(('continent_accuracy', 'Continent Accuracy', 'C2'))
-    
-    if geo_metrics:
-        plt.figure(figsize=(10, 6))
-        for metric_key, metric_label, color in geo_metrics:
-            plt.plot(epochs, history[metric_key], color=color, label=metric_label)
-        
-        plt.title('Geographical Accuracy Metrics')
-        plt.xlabel('Epochs')
-        plt.ylabel('Accuracy')
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'geographical_accuracy.png'), dpi=300)
-        plt.savefig(os.path.join(output_dir, 'geographical_accuracy.pdf'))
-        plt.close()
-    
+        ax.set(title='Validation Accuracy (n/a)')
+
+    ax = axes[1, 1]
+    if history.get('learning_rate'):
+        ax.plot(epochs, history['learning_rate'], label='LR')
+        ax.set(xlabel='Epochs', ylabel='Learning Rate', title='Learning Rate')
+    else:
+        ax.set(title='Reserved')
+
+    fig.tight_layout()
+    for ext in ('png', 'pdf'):
+        fig.savefig(os.path.join(output_dir, f'training_metrics.{ext}'), dpi=300)
+    plt.close(fig)
+
+    # plot geographic metrics if present
+    geo_keys = [
+        ('country_accuracy', 'Country'),
+        ('city_accuracy', 'City'),
+        ('continent_accuracy', 'Continent')
+    ]
+    geo = [(k, lbl) for k, lbl in geo_keys if history.get(k)]
+    if geo:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for key, label in geo:
+            ax.plot(epochs, history[key], label=label)
+        ax.set(xlabel='Epochs', ylabel='Accuracy', title='Geographical Accuracy')
+        ax.legend()
+        fig.tight_layout()
+        for ext in ('png', 'pdf'):
+            fig.savefig(os.path.join(output_dir, f'geographical_accuracy.{ext}'), dpi=300)
+        plt.close(fig)
+
     print(f"Training metrics plots saved to {output_dir}")
+
 
 def plot_evaluation_metrics(
     metrics: Dict[str, float],
     output_dir: str,
-    figsize: tuple = (10, 6)
+    figsize: Tuple[int, int] = (10, 6)
 ) -> None:
-    """
-    Plot evaluation metrics and save the plots to the output directory.
-    
-    Args:
-        metrics: Dictionary containing evaluation metrics
-        output_dir: Directory to save the plots
-        figsize: Size of the figure
-    """
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Set up plot style
-    plt.style.use('ggplot')
-    
-    # Create a bar plot for evaluation metrics
-    fig, ax = plt.subplots(figsize=figsize)
-    
-    # Filter out metrics that are not accuracy-related
-    accuracy_metrics = {k: v for k, v in metrics.items() if 'accuracy' in k.lower() or 'recall' in k.lower() or 'precision' in k.lower()}
-    
-    if not accuracy_metrics:
-        print("No accuracy metrics found for plotting.")
-        return
-    
-    # Sort metrics by value
-    sorted_metrics = sorted(accuracy_metrics.items(), key=lambda x: x[1])
-    metric_names, metric_values = zip(*sorted_metrics)
-    
-    # Create bar plot
-    bars = ax.barh(metric_names, metric_values, color='skyblue')
-    
-    # Add value labels on the bars
-    for bar in bars:
-        width = bar.get_width()
-        label_x_pos = width * 1.01
-        ax.text(label_x_pos, bar.get_y() + bar.get_height()/2, f'{width:.4f}',
-                va='center')
-    
-    ax.set_title('Evaluation Metrics')
-    ax.set_xlabel('Value')
-    
-    # Adjust layout and save the figure
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'evaluation_metrics.png'), dpi=300)
-    plt.savefig(os.path.join(output_dir, 'evaluation_metrics.pdf'))
-    plt.close()
-    
-    # Create separate figures for geographical accuracy
-    geo_categories = {
-        'continent': [k for k in metrics.keys() if 'continent' in k.lower()],
-        'country': [k for k in metrics.keys() if 'country' in k.lower()], 
-        'city': [k for k in metrics.keys() if 'city' in k.lower()]
+    plt.style.use('ggplot') 
+
+    # filter metrics to only include accuracy-like entries 
+    acc_metrics = {
+        k: v for k, v in metrics.items()
+        if any(term in k.lower() for term in ('accuracy', 'precision', 'recall'))
     }
-    
-    for category, metrics_keys in geo_categories.items():
-        if not metrics_keys:
+    if not acc_metrics:
+        print("No accuracy metrics to plot.")
+        return
+
+    names, values = zip(*sorted(acc_metrics.items(), key=lambda x: x[1]))
+    fig, ax = plt.subplots(figsize=figsize)
+    bars = ax.barh(names, values)
+    for bar in bars:
+        ax.text(bar.get_width() * 1.01, bar.get_y() + bar.get_height() / 2,
+                f'{bar.get_width():.4f}', va='center')
+    ax.set(xlabel='Value', title='Evaluation Metrics')
+    fig.tight_layout()
+    for ext in ('png', 'pdf'):
+        fig.savefig(os.path.join(output_dir, f'evaluation_metrics.{ext}'), dpi=300)
+    plt.close(fig)
+
+    # group and plot geographic accuracy by category based on key substring
+    for category in ('continent', 'country', 'city'):
+        keys = [k for k in acc_metrics if category in k.lower()]
+        if not keys:
             continue
-            
-        category_metrics = {k: metrics[k] for k in metrics_keys if k in metrics}
-        if not category_metrics:
-            continue
-            
-        plt.figure(figsize=(8, 5))
-        sorted_items = sorted(category_metrics.items(), key=lambda x: x[1])
-        labels, values = zip(*sorted_items)
-        
-        # Clean up labels for display
-        display_labels = [label.replace('_', ' ').replace('accuracy', '').strip() for label in labels]
-        if all(label == '' for label in display_labels):
-            display_labels = [label.replace('_', ' ') for label in labels]
-            
-        # Create bar chart
-        bars = plt.barh(display_labels, values, color=f'C{list(geo_categories.keys()).index(category)}')
-        
-        # Add value labels
+        items = {k: metrics[k] for k in keys}
+        labels, vals = zip(*sorted(items.items(), key=lambda x: x[1]))
+
+        display = [lbl.replace('_', ' ').title() for lbl in labels]
+        fig, ax = plt.subplots(figsize=(8, 5))
+        bars = ax.barh(display, vals)
         for bar in bars:
-            width = bar.get_width()
-            plt.text(width * 1.01, bar.get_y() + bar.get_height()/2, f'{width:.4f}', va='center')
-            
-        plt.title(f'{category.capitalize()} Level Accuracy')
-        plt.xlabel('Accuracy')
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, f'{category}_accuracy.png'), dpi=300)
-        plt.savefig(os.path.join(output_dir, f'{category}_accuracy.pdf'))
-        plt.close()
-    
-    print(f"Evaluation metrics plots saved to {output_dir}") 
+            ax.text(bar.get_width() * 1.01, bar.get_y() + bar.get_height() / 2,
+                    f'{bar.get_width():.4f}', va='center')
+        ax.set(xlabel='Accuracy', title=f'{category.title()} Accuracy')
+        fig.tight_layout()
+        for ext in ('png', 'pdf'):
+            fig.savefig(os.path.join(output_dir, f'{category}_accuracy.{ext}'), dpi=300)
+        plt.close(fig)
+
+    print(f"Evaluation metrics plots saved to {output_dir}")
