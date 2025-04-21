@@ -2,3 +2,5 @@ venv/
 Streetview_Image_Dataset/
 .env
 __pycache__/
+StreetCLIP/data/images/
+/__init__.py
