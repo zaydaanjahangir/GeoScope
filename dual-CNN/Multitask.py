@@ -58,9 +58,9 @@ class CBAM(nn.Module):
         return x
 
 
-class GeoKnowr(nn.Module):
+class DualCNN(nn.Module):
     def __init__(self, num_classes=7):
-        super(GeoKnowr, self).__init__()
+        super(DualCNN, self).__init__()
 
         self.effnet = efficientnet_b3(weights='DEFAULT')
         self.resnet = resnet50(weights='DEFAULT')
@@ -295,7 +295,7 @@ def train():
         test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
 
         print("Initializing model...")
-        model = GeoKnowr(num_classes=NUM_CLASSES).to(DEVICE)
+        model = DualCNN(num_classes=NUM_CLASSES).to(DEVICE)
         print(f"Using device: {DEVICE}")
 
         criterion_cls = nn.CrossEntropyLoss()
@@ -408,7 +408,7 @@ def train():
                 'val_loss': val_losses,
                 'val_acc': val_accuracies
             }
-        }, "geoknowr_model.pth")
+        }, "DualCNN_model.pth")
 
         print("\nTraining complete!")
         print(f"Final Test Accuracy: {test_acc:.2f}%")
