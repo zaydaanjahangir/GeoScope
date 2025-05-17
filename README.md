@@ -10,7 +10,7 @@ GeoScope is a deep learning framework for image geolocalization. The project lev
 
 ## Overview
 
-GeoScope addresses the challenge of image geolocalization—a problem with critical applications in photo tagging, search, and open-source intelligence—by mapping images to predefined geographic regions. By integrating transfer learning and vision-language models, GeoScope aims to overcome data scarcity and improve robustness to distribution shifts.
+GeoScope addresses the challenge of image geolocalization, a problem with critical applications in photo tagging, search, and open-source intelligence, by mapping images to predefined geographic regions. By integrating transfer learning and vision-language models, GeoScope aims to overcome data scarcity and improve robustness to distribution shifts.
 
 ## Key Features
 
